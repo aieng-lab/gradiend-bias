@@ -116,6 +116,13 @@ def generate_data(bias_type='race'):
         ds.save_to_disk(save_path)
         print(f"Saved dataset for {orig} → {repl} at {save_path}")
 
-if __name__ == "__main__":
+
+def generate_race_data():
     generate_data(bias_type='race')
+
+def generate_religion_data():
     generate_data(bias_type='religion')
+
+if __name__ == "__main__":
+    generate_race_data()
+    generate_religion_data()

@@ -198,6 +198,9 @@ class DecoderModelWithMLMHead(PreTrainedModel):
                     logits = logits[valid_mask]
                     mapped_labels = mapped_labels[valid_mask]
                     loss = loss_fct(logits, mapped_labels)
+                else:
+                    # create dummy loss
+                    loss = torch.tensor(0.0, requires_grad=True)
 
         return DecoderWithMLMHeadOutput(logits=logits, loss=loss)
 

@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import time
 from pprint import pprint
 
@@ -1015,7 +1016,7 @@ def evaluate_model(model, tokenizer, verbose=True, df_name=None, thorough=True, 
         print(f"Non-gender MLM evaluation time: {non_gender_mlm_time:.2f} seconds ({non_gender_mlm_relative:.2%} of total time)")
         print(f"Gender bias names evaluation time: {gender_bias_name_time:.2f} seconds ({gender_bias_name_relative:.2%} of total time)")
 
-    accuracy = non_gender_mlm_stats['accuracy']
+    accuracy = non_gender_mlm_stats['lms']
     for key in ['bpi', 'mpi', 'fpi']:
         score = gender_bias_name_stats[f'_{key}']
         result[key] = score * accuracy
@@ -1069,7 +1070,105 @@ def convert_results_to_list(dict_results):
     return [{**dict_result, 'id': (key if isinstance(key, str) else {'feature_factor': key[0], 'lr': key[1]})} for key, dict_result in dict_results.items()]
 
 
-def evaluate_gradiend(model_with_gradiend, feature_factors=None, lrs=None, thorough=True, top_k=None, accuracy_function=None, part='decoder', top_k_part='decoder'):
+from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
+
+def run_bayesian_optimization(model_with_gradiend,
+                              feature_factors,
+                              lrs,
+                              optimize_metric,
+                              accuracy_function,
+                              thorough,
+                              top_k,
+                              part,
+                              top_k_part,
+                              cache_results,
+                              max_evals):
+    tokenizer = model_with_gradiend.tokenizer
+    latent_dim = model_with_gradiend.gradiend.latent_dim
+    evaluated_pairs = set(cache_results.keys())  # base + pairs
+
+    # Define hyperopt search space
+    def ff_space():
+        if latent_dim == 1:
+            return hp.choice("ff0", feature_factors)
+        return tuple(hp.choice(f"ff{i}", feature_factors) for i in range(latent_dim))
+
+    space = {
+        "feature_factor": ff_space(),
+        "lr": hp.choice("lr", lrs)
+    }
+
+    def get_metric(result):
+        acc = result["mlm"]["accuracy"]
+        return accuracy_function(acc) * result["gender_bias_names"][f"_{optimize_metric}"]
+
+    # Hyperopt objective
+    def objective(params):
+        ff = params["feature_factor"]
+        lr = params["lr"]
+        key = (ff, lr)
+
+        # CACHE HIT
+        if key in cache_results:
+            metric = get_metric(cache_results[key])
+            return {"loss": -metric, "status": STATUS_OK}
+
+        # CACHE MISS → evaluate
+        enhanced = model_with_gradiend.modify_model(
+            lr=lr, feature_factor=ff, top_k=top_k, part=part, top_k_part=top_k_part
+        )
+        result = evaluate_model(
+            enhanced, tokenizer, thorough=thorough,
+            cache_folder=f"{ff}_{lr}_bayes"
+        )
+
+        del enhanced
+        torch.cuda.empty_cache()
+
+        cache_results[key] = result  # write to in-memory cache
+
+        metric = get_metric(result)
+        return {"loss": -metric, "status": STATUS_OK}
+
+    # Run Bayesian optimization
+    trials = Trials()
+    fmin(
+        fn=objective,
+        space=space,
+        algo=tpe.suggest,
+        max_evals=max_evals,
+        trials=trials,
+        rstate=np.random.default_rng(0)
+    )
+
+    # Identify BO-generated pairs
+    produced_pairs = set()
+    for t in trials.trials:
+        vals = t["misc"]["vals"]
+        if latent_dim == 1:
+            ff = feature_factors[vals["ff0"][0]]
+        else:
+            ff = tuple(feature_factors[vals[f"ff{i}"][0]] for i in range(latent_dim))
+        lr = lrs[vals["lr"][0]]
+        produced_pairs.add((ff, lr))
+
+    # Return ONLY pairs not yet evaluated
+    missing_pairs = produced_pairs - evaluated_pairs
+    return missing_pairs
+
+
+def evaluate_gradiend(model_with_gradiend,
+                      feature_factors=None,
+                      lrs=None,
+                      thorough=True,
+                      top_k=None,
+                      accuracy_function=None,
+                      part='decoder',
+                      top_k_part='decoder',
+                      search_strategy='grid', # or 'opt'
+                      optimize_metric='bpi',
+                      max_opt_evals=1000,
+                      ):
     if isinstance(model_with_gradiend, str):
         path_or_model = model_with_gradiend
         model_with_gradiend = ModelWithGradiend.from_pretrained(model_with_gradiend)
@@ -1083,7 +1182,7 @@ def evaluate_gradiend(model_with_gradiend, feature_factors=None, lrs=None, thoro
         raw_results = {k: v.copy() for k, v in results.items() if k not in metric_keys}
 
         for k, entry in raw_results.items():
-            acc = entry['mlm']['accuracy']
+            acc = entry['mlm']['lms']
             for key in metric_keys:
                 sub_key = f'_{key}'
                 value = accuracy_function(acc) * entry['gender_bias_names'][sub_key]
@@ -1116,8 +1215,6 @@ def evaluate_gradiend(model_with_gradiend, feature_factors=None, lrs=None, thoro
     os.makedirs(os.path.dirname(base_file), exist_ok=True)
     os.makedirs(os.path.dirname(file), exist_ok=True)
 
-    pairs = {(feature_factor, lr) for feature_factor in feature_factors for lr in lrs}
-    expected_results = len(pairs) + 1 + 3 # 1 because of base, 3 because of bpi, mpi, fpi
 
     try:
         relevant_results = json.load(open(file, 'r'))
@@ -1131,15 +1228,57 @@ def evaluate_gradiend(model_with_gradiend, feature_factors=None, lrs=None, thoro
                 print('WARNING')
 
         # check if complete
-        if len(relevant_results) == expected_results:
-            return apply_accuracy_function(relevant_results)
     except FileNotFoundError:
         relevant_results = {}
     except Exception as e:
         print(f'Error for {file}')
         raise e
 
+    # Additional check for Bayesian optimization:
+    # If search_strategy="opt" and we already have all base + max_evals results,
+    # skip BO entirely and return cached results.
+    if search_strategy == "opt":
+        # count only parameter pairs (excluding 'base' and metric entries)
+        cached_pairs = [k for k in relevant_results.keys()
+                        if k not in ['base', 'bpi', 'mpi', 'fpi']]
 
+        if len(cached_pairs) >= max_opt_evals:
+            # enough BO results in cache → skip optimization
+            return apply_accuracy_function(relevant_results)
+
+    if search_strategy == "grid":
+        if model_with_gradiend.gradiend.latent_dim == 1:
+            pairs = {(feature_factor, lr) for feature_factor in feature_factors for lr in lrs}
+        else:
+            pairs = set()
+            max_pairs = 1000
+            for _ in range(max_pairs):
+                lr = random.choice(lrs)
+                feature_factor = tuple(random.choices(feature_factors, k=model_with_gradiend.gradiend.latent_dim))
+                pairs.add((feature_factor, lr))
+
+    elif search_strategy == "opt":
+        pairs = run_bayesian_optimization(
+            model_with_gradiend=model_with_gradiend,
+            feature_factors=feature_factors,
+            lrs=lrs,
+            optimize_metric=optimize_metric,
+            accuracy_function=accuracy_function,
+            thorough=thorough,
+            top_k=top_k,
+            part=part,
+            top_k_part=top_k_part,
+            cache_results=relevant_results,
+            max_evals=max_opt_evals
+        )
+
+    expected_results = len(pairs) + 1 + 3 # 1 because of base, 3 because of bpi, mpi, fpi
+
+
+
+
+    if len(relevant_results) == expected_results:
+        return apply_accuracy_function(relevant_results)
     try:
         all_results = json.load(open(base_file, 'r'))
         raw_all_results = convert_results_to_dict(all_results)
@@ -1224,6 +1363,7 @@ def plot_gradiend_model_selection(data,
                                   overview_plot=False,
                                   linear_plot=True,
                                   horizontal_plot=False,
+                                  **kwargs,
                                   ):
     metrics = metrics or ['avg_prob_m', 'avg_prob_f', 'accuracy', 'bpi', 'fpi', 'mpi']
     highlight_metrics = highlight_metrics or ['bpi', 'fpi', 'mpi']
@@ -1285,7 +1425,7 @@ def plot_gradiend_model_selection(data,
         elif metric in x:
             return x[metric]
         elif metric == 'accuracy':
-            x = x['mlm']['accuracy']
+            x = x['mlm']['lms']
         elif metric in {'gender_preference_accuracy', 'overall_accuracy', 'average_absolute_difference'}:
             x = x[''] # todo what? Deprecated??
         elif metric == 'avg_prob_m + avg_prob_f':
@@ -1938,7 +2078,7 @@ def top_neuron_evaluation(model, bin_size=100, lr=None, feature_factor=None, key
 
 default_evaluation_feature_factors = [-10, -2] + [-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0] + [2, 10]
 default_evaluation_lrs = [-0.5, -1e-1, -5e-2, -1e-2, -5e-3, -1e-3, -5e-4, -1e-4,  1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 0.5] # -5e-5, -1e-5, 1e-5, 5e-5,
-def default_evaluation(model, large=True, plot=True, top_k=None, accuracy_function=None, part='decoder', top_k_part='decoder', **kwargs):
+def default_evaluation(model, large=True, plot=True, top_k=None, accuracy_function=None, part='decoder', top_k_part='decoder', search_strategy='grid', **kwargs):
     if large:
         feature_factors = default_evaluation_feature_factors
         lrs = default_evaluation_lrs
@@ -1947,7 +2087,7 @@ def default_evaluation(model, large=True, plot=True, top_k=None, accuracy_functi
         feature_factors = [-1, 0, 1]
         lrs = [1e-2, 1e-3, 1e-4, 1e-5]
 
-    data = evaluate_gradiend(model, feature_factors, lrs, thorough=large, top_k=top_k, accuracy_function=accuracy_function, part=part, top_k_part=top_k_part)
+    data = evaluate_gradiend(model, feature_factors, lrs, thorough=large, top_k=top_k, accuracy_function=accuracy_function, part=part, top_k_part=top_k_part, search_strategy=search_strategy)
 
     if plot:
         model = os.path.basename(model.removesuffix('model_with_gradiend'))
@@ -1971,7 +2111,7 @@ def test_aggregation_functions(model):
     base_file, _ = get_evaluation_file(f'results/cache/decoder/{model_id}', default_evaluation_feature_factors, default_evaluation_lrs)
 
     def bpi_fpi_mpi(stats, accuracy_conversion_function):
-        acc = stats['mlm']['accuracy']
+        acc = stats['mlm']['lms']
         converted_acc = accuracy_conversion_function(acc)
 
         bpi = converted_acc * stats['gender_bias_names']['_bpi']

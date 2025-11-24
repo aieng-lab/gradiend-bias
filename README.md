@@ -1,4 +1,4 @@
-# GRADIEND: Monosemantic Feature Learning within Neural Networks Applied to Gender Debiasing of Transformer Models
+# GRADIEND: Feature Learning within neural networks exemplified through biases
 > Jonathan Drechsel, Steffen Herbold
 [![arXiv](https://img.shields.io/badge/arXiv-2502.01406-blue.svg)](https://arxiv.org/abs/2502.01406)
 

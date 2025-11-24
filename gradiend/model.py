@@ -11,9 +11,12 @@ import torch.nn.functional as F
 from matplotlib import pyplot as plt
 from scipy.stats import binned_statistic
 from torch.nn import Parameter
-from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModelForCausalLM, AutoConfig, GPT2Config
+from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModelForCausalLM, AutoConfig, GPT2Config, \
+    AutoModelForSequenceClassification
 import json
 import os
+
+from transformers.modeling_outputs import MaskedLMOutput
 
 from gradiend.training.decoder_only_mlm.model import DecoderModelWithMLMHead
 from gradiend.util import hash_it, convert_tuple_keys_recursively
@@ -313,6 +316,90 @@ Args:
         self.linear.bias = value  # Avoid re-registering
 
 
+
+
+class ModelForClassificationWithMLM(nn.Module):
+    """
+    Acts as a BertForMaskedLM during forward,
+    but only saves the classification model when calling save_pretrained().
+    """
+
+    def __init__(self, cls_checkpoint: str, mlm_checkpoint: str = None):
+        super().__init__()
+        # Load classification model (base encoder + classifier)
+
+        self.cls_model = AutoModelForSequenceClassification.from_pretrained(cls_checkpoint)
+
+        # find encoder module (works for bert, distilbert, roberta, xlm-roberta, ...)
+        for candidate in ("bert", "distilbert", "roberta", "xlm_roberta", "electra", "albert"):
+            if hasattr(self.cls_model, candidate):
+                self.encoder_name = candidate
+                self.encoder = getattr(self.cls_model, candidate)
+                break
+        else:
+            # fallback: some HF wrappers expose .base_model
+            if hasattr(self.cls_model, "base_model"):
+                self.encoder = self.cls_model.base_model
+                self.encoder_name = getattr(self.cls_model, "base_model_prefix", "base_model")
+            else:
+                raise ValueError("Couldn't locate encoder submodule on classification model")
+
+        # Optionally load MLM head on same base encoder architecture
+        if mlm_checkpoint:
+            try:
+                self.mlm_model = AutoModelForMaskedLM.from_pretrained(mlm_checkpoint)
+            except Exception:
+                self.mlm_model = AutoModelForCausalLM.from_pretrained(mlm_checkpoint)
+            self.mlm_head = self.mlm_model.get_output_embeddings()
+        else:
+            self.mlm_head = None
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        # DistilBERT/others return last_hidden_state as .last_hidden_state or .hidden_states[...]
+        sequence_output = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+        prediction_scores = self.mlm_head(sequence_output) if self.mlm_head is not None else None
+
+        loss = None
+        if labels is not None and prediction_scores is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(
+                prediction_scores.view(-1, prediction_scores.size(-1)),
+                labels.view(-1),
+            )
+
+        return MaskedLMOutput(
+            loss=loss,
+            logits=prediction_scores,
+            hidden_states=outputs.hidden_states if hasattr(outputs, "hidden_states") else None,
+            attentions=outputs.attentions if hasattr(outputs, "attentions") else None,
+        )
+
+    def named_parameters(self, prefix='', recurse=True):
+        # expose encoder params + mlm_head params only
+        for name, param in self.encoder.named_parameters(prefix=f"{prefix}{self.encoder_name}", recurse=recurse):
+            yield name, param
+        if self.mlm_head is not None:
+            for name, param in self.mlm_head.named_parameters(prefix=f"{prefix}mlm_head", recurse=recurse):
+                yield name, param
+
+    def save_pretrained(self, save_directory):
+        self.cls_model.save_pretrained(save_directory)
+
+    @classmethod
+    def from_pretrained(cls, cls_checkpoint: str, mlm_checkpoint: str = None):
+        return cls(cls_checkpoint=cls_checkpoint, mlm_checkpoint=mlm_checkpoint)
+
+    @property
+    def name_or_path(self):
+        return self.cls_model.name_or_path
+
+    @property
+    def dtype(self):
+        return self.cls_model.dtype
+
+
+
 class GradiendModel(nn.Module):
     def __init__(self, input_dim,
                  latent_dim,
@@ -341,6 +428,8 @@ class GradiendModel(nn.Module):
         self.bias_decoder = bias_decoder
         self.torch_dtype = torch_dtype
         self.kwargs = kwargs
+        if 'base_model' in kwargs and hasattr(kwargs['base_model'], 'name_or_path'):
+                self.kwargs['base_model'] = kwargs['base_model'].name_or_path
 
         activation_fnc = get_activation(self.activation, encoder=True)
 
@@ -544,8 +633,6 @@ class GradiendModel(nn.Module):
         with open(config_path, 'w') as f:
             json.dump(config, f)
 
-
-
     def _serialize_kwargs(self):
         kwargs = self.kwargs.copy()
         training_kwargs = kwargs['training']['config'].copy()
@@ -742,7 +829,13 @@ class CombinedGradiendModel(GradiendModel):
 
 
 def is_generative(model):
-    return 'ForMaskedLM' not in str(type(model))
+    if isinstance(model, ModelForClassificationWithMLM):
+        model = model.mlm_model
+
+    if 'bert' in str(type(model)).lower():
+        return False
+
+    return not any(x in str(type(model)) for x in ['ForMaskedLM', 'MLMHead', 'WithMLM'])
 
 
 class ModelWithGradiend(nn.Module):
@@ -761,8 +854,11 @@ class ModelWithGradiend(nn.Module):
 
         self.is_instruction_model = isinstance(self.tokenizer, InstructTokenizerWrapper)
         self.is_generative = is_generative(self.base_model)
+        self._enhancer_mask_cache = {}
 
         if self.is_generative:
+            if self.tokenizer.eos_token is None:
+                raise ValueError('Tokenizer must have an eos_token for generative models')
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
@@ -832,14 +928,22 @@ class ModelWithGradiend(nn.Module):
         else:
             return self.create_base_model_outputs(text, label)
 
-    def encode(self, input, label=None):
+    def encode(self, input, label=None, top_k=None, top_k_part=None):
+        top_k_part = top_k_part or 'encoder'
+
         if isinstance(input, str):
             assert label is not None, 'Label must be provided if input is a string'
             input = self.create_encoder_inputs(input, label)
 
-        encoded = self.gradiend.encoder(input)
-        #if len(encoded) == 1:
-        #    encoded = encoded.item()
+        if top_k is not None:
+            # only use the top k elements of the encoder (wrt. to absolute value)
+            mask = self.get_enhancer_mask(top_k, part=top_k_part)
+            masked_encoder = self.gradiend.encoder[0].weight.flatten()[mask]
+            masked_input = input[mask]
+            encoded = torch.matmul(masked_input.unsqueeze(0), masked_encoder.unsqueeze(1)).squeeze(1) + self.gradiend.encoder[0].bias
+            encoded = self.gradiend.encoder[1](encoded)
+        else:
+            encoded = self.gradiend.encoder(input)
 
         return encoded
 
@@ -911,6 +1015,8 @@ class ModelWithGradiend(nn.Module):
             abs_enhancer = self.gradiend.decoder[0].bias.abs()
         elif part == 'decoder-sum':
             abs_enhancer = (self.gradiend.decoder[0].weight.flatten() + self.gradiend.decoder[0].bias).abs()
+        elif part == 'encoder':
+            abs_enhancer = self.gradiend.encoder[0].weight.flatten().abs()
         else:
             raise ValueError('Unsupported part:', part)
 
@@ -918,7 +1024,16 @@ class ModelWithGradiend(nn.Module):
 
 
     def get_enhancer_mask(self, top_k, part='decoder'):
+        cache_key = f'{top_k}_{part}'
+        if cache_key in self._enhancer_mask_cache:
+            return self._enhancer_mask_cache[cache_key]
+
         gradiend_vector = self.gradiend.decoder[0].weight.flatten()
+
+        if top_k == 0.0:
+            mask = torch.zeros_like(gradiend_vector, dtype=torch.bool)
+            self._enhancer_mask_cache[cache_key] = mask
+            return mask
 
         if 0.0 < top_k <= 1.0:
             top_k = int(top_k * len(gradiend_vector))
@@ -933,6 +1048,7 @@ class ModelWithGradiend(nn.Module):
         top_k_indices = sorted_indices[top_k_sorted_indices]
         mask = torch.zeros_like(gradiend_vector, dtype=torch.bool)
         mask[top_k_indices] = True
+        self._enhancer_mask_cache[cache_key] = mask
         return mask
 
     def get_layer_mask(self, top_k, part='decoder'):
@@ -971,7 +1087,7 @@ class ModelWithGradiend(nn.Module):
 
 
 
-    def mask_and_encode(self, text, ignore_tokens=False, return_masked_text=False, single_mask=True):
+    def mask_and_encode(self, text, ignore_tokens=False, return_masked_text=False, single_mask=True, top_k=None, top_k_part=None):
         item = self.tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
         item = {k: v.to(self.base_model_device) for k, v in item.items()}
         labels = item['input_ids'].clone()
@@ -1036,7 +1152,21 @@ class ModelWithGradiend(nn.Module):
         gradients = self.gradiend.extract_gradients(self.base_model)
         self.base_model.zero_grad(set_to_none=True)
 
-        encoded = self.gradiend.encoder(gradients).item()
+        if top_k is not None:
+            top_k_part = top_k_part or 'encoder'
+            enhancer_mask = self.get_enhancer_mask(top_k=top_k, part=top_k_part)
+            masked_encoder = self.gradiend.encoder[0].weight.flatten()[enhancer_mask]
+            masked_input = gradients[enhancer_mask]
+            encoded = torch.matmul(masked_input.unsqueeze(0), masked_encoder.unsqueeze(1)).squeeze(1) + self.gradiend.encoder[0].bias
+            encoded = self.gradiend.encoder[1](encoded)
+        else:
+            encoded = self.gradiend.encoder(gradients)
+
+        if hasattr(encoded, 'tolist'):
+            encoded = encoded.tolist()
+
+        if len(encoded) == 1:
+            encoded = encoded[0]
 
         if return_masked_text:
             masked_str = self.tokenizer.decode(item['input_ids'].squeeze())
@@ -1048,7 +1178,7 @@ class ModelWithGradiend(nn.Module):
 
 
     def create_inputs(self, masked_text, label):
-        item = self.tokenizer(masked_text, return_tensors="pt")
+        item = self.tokenizer(masked_text, return_tensors="pt", max_length=self.tokenizer.model_max_length, truncation=True)
         item = {k: v.to(self.base_model_device) for k, v in item.items()}
         if hasattr(self.tokenizer, 'tokenizer'):
             label_token_id = self.tokenizer.tokenizer(f' {label}', add_special_tokens=False)['input_ids']
@@ -1297,6 +1427,8 @@ class ModelWithGradiend(nn.Module):
                         use_gradients=True,
                         init_gradiends=None,
                         **kwargs):
+        assert isinstance(load_directory, str) or hasattr(load_directory, 'name_or_path'), 'load_directory must be a string or an AutoModelForLM instance, but got: {}'.format(type(load_directory))
+
         device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         device_encoder = device
         device_decoder = device
@@ -1330,7 +1462,8 @@ class ModelWithGradiend(nn.Module):
             if len(layers) == 1 and isinstance(layers[0], list):
                 layers = layers[0]
 
-            if 'llama' in load_directory.lower():
+            load_directory_str = load_directory if isinstance(load_directory, str) else load_directory.name_or_path
+            if 'llama' in load_directory_str.lower():
                 # check that two GPUs are available
                 cuda_count = torch.cuda.device_count()
                 if cuda_count < 2:
@@ -1359,7 +1492,7 @@ class ModelWithGradiend(nn.Module):
                 base_model = AutoModelForLM.from_pretrained(base_model_id, torch_dtype=torch_dtype).to(device_base_model)
                 tokenizer = gradiend.kwargs.get('tokenizer', base_model_id)
                 tokenizer = AutoTokenizerForLM.from_pretrained(tokenizer)
-            except FileNotFoundError or TypeError:
+            except (FileNotFoundError, TypeError, ValueError):
                 print('No model with GRADIEND found in the specified directory:', load_directory, ' -> creating a new GRADIEND')
 
                 if isinstance(load_directory, str):
@@ -1367,10 +1500,12 @@ class ModelWithGradiend(nn.Module):
                     tokenizer = AutoTokenizerForLM.from_pretrained(load_directory)
                 else:
                     base_model = load_directory
-                    tokenizer = base_model.tokenizer
+                    tokenizer = AutoTokenizerForLM.from_pretrained(base_model.name_or_path)
 
                 excluded_layers = {
                     'cls.prediction', # todo check if this is still needed as we use base_model (e.g. ,BertModel, rather than BertForMaskedLM)
+                    'lm_head',
+                    'pooler.dense',
                 }
 
                 layer_map = {k: v for k, v in base_model.named_parameters() if not any(x in k.lower() for x in excluded_layers)}

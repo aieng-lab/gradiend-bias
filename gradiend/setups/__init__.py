@@ -52,6 +52,9 @@ class Setup:
         return create_eval_dataset(self, *args, **kwargs)
 
 
+    def _post_training(self, base_output, step=None, **kwargs):
+        pass
+
     def evaluate_old(self, model_with_gradiend, eval_data, eval_batch_size=32, **kwargs):
         start = time.time()
         grads = eval_data['gradients']
@@ -166,46 +169,82 @@ class Setup:
         start = time.time()
         single_eval = False
 
-        if not isinstance(eval_data, dict):
-            raise TypeError("eval_data must be a dictionary.")
-
-        if 'gradients' in eval_data and 'labels' in eval_data:
+        if isinstance(eval_data, ModelFeatureTrainingDataset):
             eval_data = {'main': eval_data}
             single_eval = True
         else:
-            # sanitize eval_data
-            for k, v in eval_data.items():
-                if 'gradients' not in v or 'labels' not in v:
-                    raise ValueError(f"eval_data must contain 'gradients' and 'labels' keys, but did not found these for {k}.")
+            if not isinstance(eval_data, dict):
+                raise TypeError("eval_data must be a dictionary.")
+
+            if 'gradients' in eval_data and 'labels' in eval_data:
+                eval_data = {'main': eval_data}
+                single_eval = True
+            else:
+                # sanitize eval_data
+                for k, v in eval_data.items():
+                    if 'gradients' not in v or 'labels' not in v:
+                        raise ValueError(f"eval_data must contain 'gradients' and 'labels' keys, but did not found these for {k}.")
 
         # sort eval_data s.t. 'train' gets evaluated before 'main'
         eval_data = dict(sorted(eval_data.items(), key=lambda x: x[0] != 'train'))
 
+        torch_dtype = model_with_gradiend.gradiend.torch_dtype
+        device = model_with_gradiend.gradiend.device_encoder
+        source = kwargs['config']['source']
+        target_key = f'{source}_target'
         total_result = {}
+        other_interesting_keys = ['texts', 'factual_target', 'counterfactual_target']
+        targets2indices = defaultdict(list)
+        other_keys = defaultdict(list)
         for eval_key, eval_sub_data in eval_data.items():
-            grads = eval_sub_data['gradients']
-            labels = eval_sub_data['labels']
 
-            label_dim = len(labels[0]) if hasattr(labels[0], '__len__') else 1
-            torch_dtype = model_with_gradiend.gradiend.torch_dtype
-            device = model_with_gradiend.gradiend.device_encoder
-
-            # Encode gradients
             encoded = []
-            if eval_batch_size > 1:
-                for i in range(0, len(grads), eval_batch_size):
-                    batch = grads[i:min(i + eval_batch_size, len(grads))]
-                    batch_on_device = [g.to(device, dtype=torch_dtype) for g in batch]
-                    encoded_batch = model_with_gradiend.encode(torch.stack(batch_on_device))
-                    encoded.extend(encoded_batch.tolist())
-                    del batch_on_device
-                    del encoded_batch
-                    torch.cuda.empty_cache()
-            else:
-                for g in grads:
-                    encoded_value = model_with_gradiend.encode(g.to(device, dtype=torch_dtype))
+            binary_labels = []
+            if isinstance(eval_sub_data, ModelFeatureTrainingDataset):
+                labels = []
+                for i, entry in enumerate(tqdm(eval_sub_data, desc=f'Encoding eval data for {eval_key}', leave=False)):
+                    grad = entry['source']
+                    label = entry['label']
+                    encoded_value = model_with_gradiend.encode(grad.to(device, dtype=torch_dtype))
                     encoded.append(encoded_value.tolist())
-                    del encoded_value
+                    labels.append(label)
+                    targets2indices[target_key].append(i)
+                    binary_labels.append(entry['binary_label'])
+
+                    for key in other_interesting_keys:
+                        if key in entry:
+                            other_keys[key].append(entry[key])
+            else:
+                grads = eval_sub_data['gradients']
+                labels = eval_sub_data['labels']
+
+                # Encode gradients
+                if eval_batch_size > 1:
+                    for i in range(0, len(grads), eval_batch_size):
+                        batch = grads[i:min(i + eval_batch_size, len(grads))]
+                        batch_on_device = [g.to(device, dtype=torch_dtype) for g in batch]
+                        encoded_batch = model_with_gradiend.encode(torch.stack(batch_on_device))
+                        encoded.extend(encoded_batch.tolist())
+                        del batch_on_device
+                        del encoded_batch
+                        torch.cuda.empty_cache()
+                else:
+                    for g in grads:
+                        encoded_value = model_with_gradiend.encode(g.to(device, dtype=torch_dtype))
+                        encoded.append(encoded_value.tolist())
+                        del encoded_value
+
+                for i, t in enumerate(eval_sub_data[target_key]):
+                    targets2indices[t].append(i)
+
+                other_keys = {}
+                for key in other_interesting_keys:
+                    if key in eval_sub_data:
+                        other_keys[key] = eval_sub_data[key]
+
+
+
+                binary_labels = eval_sub_data['binary_labels']
 
             encoded = np.array(encoded).tolist()  # ensure JSON-serializable format
             labels = np.array(labels).tolist()
@@ -216,65 +255,36 @@ class Setup:
             multi_output = None
 
             # Try direct dimensional match
-            if False:
-                try:
-                    if isinstance(labels[0], list):
-                        label_dim = len(labels[0])
-                        if label_dim == self.n_features:
-                            scores = []
-                            for i in range(self.n_features):
-                                y_true = [l[i] for l in labels]
-                                y_pred = [e[i] for e in encoded]
-                                corr = pearsonr(y_true, y_pred).correlation
-                                if not np.isnan(corr):
-                                    scores.append(corr)
-                            score = float(np.mean(scores)) if scores else 0.0
-                            best_dims = list(range(self.n_features))
-                        else:
-                            raise ValueError("Dimension mismatch")
-                    else:
-                        # labels are scalar
-                        y_true = labels
-                        y_pred = [e[0] if isinstance(e, list) else e for e in encoded]
-                        corr = pearsonr(y_true, y_pred).correlation
-                        score = float(corr) if not np.isnan(corr) else 0.0
-                        best_dims = [0]
-                except Exception:
-                    # fallback: search best subset
-                    best_score = -np.inf
-                    if not isinstance(labels[0], list):
-                        labels_1d = labels
-                        for k in range(1, min(max_subset_size, encoded_dim) + 1):
-                            for dims in combinations(range(encoded_dim), k):
-                                agg = [float(np.mean([e[d] for d in dims])) for e in encoded]
-                                corr = pearsonr(labels_1d, agg).correlation
-                                if not np.isnan(corr) and corr > best_score:
-                                    best_score = corr
-                                    best_dims = list(dims)
-                        score = float(best_score) if not np.isnan(best_score) else 0.0
-                    else:
-                        label_dim = len(labels[0])
-                        for dims in combinations(range(encoded_dim), label_dim):
-                            try:
-                                corr_list = []
-                                for i in range(label_dim):
-                                    y_true = [l[i] for l in labels]
-                                    y_pred = [e[dims[i]] for e in encoded]
-                                    corr = pearsonr(y_true, y_pred).correlation
-                                    if not np.isnan(corr):
-                                        corr_list.append(corr)
-                                avg_corr = float(np.mean(corr_list)) if corr_list else -np.inf
-                                if avg_corr > best_score:
-                                    best_score = avg_corr
-                                    best_dims = list(dims)
-                            except Exception:
-                                continue
-                        score = float(best_score) if not np.isnan(best_score) else 0.0
+            labels_np = np.array(labels)
+            encoded_np = np.array(encoded)
+
+
+            if len(labels_np.shape) > 1 and labels_np.shape[1] > 1 and encoded_np.shape[1] == 1:
+                # labels are categorical and encoded is scalar
+                def correlation_ratio(categories, values):
+                    categories = np.array(categories)
+                    values = np.array(values)
+                    class_means = [values[categories == c].mean() for c in np.unique(categories)]
+                    n = [np.sum(categories == c) for c in np.unique(categories)]
+                    grand_mean = values.mean()
+                    ss_between = np.sum(
+                        [n[i] * (class_means[i] - grand_mean) ** 2 for i in range(len(class_means))])
+                    ss_total = np.sum((values - grand_mean) ** 2)
+                    return np.sqrt(ss_between / ss_total)
+
+                # todo make this generic; this is just a simple fix
+                category_mapper = {
+                    (-1, 0, 0): 'White',
+                    (0, -1, 0): 'White',
+                    (1, 0, 0): 'Black',
+                    (0, 0, -1): 'Black',
+                    (0, 1, 0): 'Asian',
+                    (0, 0, 1): 'Asian',
+                }
+                categories = [category_mapper.get(tuple(row), 'Other') for row in labels_np]
+
+                final_score = correlation_ratio(categories, encoded_np[:, 0])
             else:
-
-                labels_np = np.array(labels)
-                encoded_np = np.array(encoded)
-
                 if len(labels_np.shape) == 2:
                     n_samples, label_dim = labels_np.shape
                 elif len(labels_np.shape) == 1:
@@ -330,92 +340,89 @@ class Setup:
                     "result_per_label_dim": result_per_label_dim,
                     "final_score": final_score
                 }
-                score = final_score
+            score = final_score
 
-                if eval_key == 'main':
+            if eval_key == 'main':
 
-                    if 'train' in eval_data:
-                        encoded_train_np = np.array(total_result['train']['encoded'])
-                        labels_train_np = np.array(eval_data['train']['labels'])
-                        encoded_test_np = encoded_np
-                        labels_test_np = labels_np
-                    else:
-                        # apply deterministic train test split to data
-                        encodings_train_np, encodings_test_np, labels_train_np, labels_test_np = train_test_split(
-                            encoded_np, labels_np, test_size=0.2, random_state=42
-                        )
+                if 'train' in eval_data:
+                    encoded_train_np = np.array(total_result['train']['encoded'])
+                    labels_train_np = np.array(eval_data['train']['labels'])
+                    encoded_test_np = encoded_np
+                    labels_test_np = labels_np
+                else:
+                    # apply deterministic train test split to data
+                    encodings_train_np, encodings_test_np, labels_train_np, labels_test_np = train_test_split(
+                        encoded_np, labels_np, test_size=0.2, random_state=42
+                    )
 
 
-                    def is_binary_column(col):
-                        unique = np.unique(col)
-                        return len(unique) == 2 and set(unique) <= {0, 1}
+                def is_binary_column(col):
+                    unique = np.unique(col)
+                    return len(unique) == 2 and set(unique) <= {0, 1}
 
-                    def analyze_label_encodings(
-                            labels_train: np.ndarray,
-                            labels_test: np.ndarray,
-                            encoded_train: np.ndarray,
-                            encoded_test: np.ndarray,
-                            subset_sizes = [2]
-                    ):
-                        n_labels = labels_train.shape[1]
-                        n_enc_dims = encoded_train.shape[1]
+                def analyze_label_encodings(
+                        labels_train: np.ndarray,
+                        labels_test: np.ndarray,
+                        encoded_train: np.ndarray,
+                        encoded_test: np.ndarray,
+                        subset_sizes = [2]
+                ):
+                    n_labels = labels_train.shape[1]
+                    n_enc_dims = encoded_train.shape[1]
 
-                        results = []
+                    results = []
 
-                        for i in range(n_labels):
-                            y_train = labels_train[:, i]
-                            y_test = labels_test[:, i]
-                            is_binary = is_binary_column(y_train)
+                    for i in range(n_labels):
+                        y_train = labels_train[:, i]
+                        y_test = labels_test[:, i]
+                        is_binary = is_binary_column(y_train)
 
-                            best_score = -np.inf
-                            best_subset = None
-                            best_coef = None
-                            best_model = None
+                        best_score = -np.inf
+                        best_subset = None
+                        best_coef = None
+                        best_model = None
 
-                            for k in subset_sizes:
-                                for dims in combinations(range(n_enc_dims), r=k):
-                                    X_train_sub = encoded_train[:, dims]
-                                    X_test_sub = encoded_test[:, dims]
+                        for k in subset_sizes:
+                            for dims in combinations(range(n_enc_dims), r=k):
+                                X_train_sub = encoded_train[:, dims]
+                                X_test_sub = encoded_test[:, dims]
 
-                                    try:
-                                        if is_binary:
-                                            model = LogisticRegression().fit(X_train_sub, y_train)
-                                            y_pred = model.predict(X_test_sub)
-                                            score = accuracy_score(y_test, y_pred)
-                                        else:
-                                            model = LinearRegression().fit(X_train_sub, y_train)
-                                            y_pred = model.predict(X_test_sub)
-                                            score = r2_score(y_test, y_pred)
-                                    except Exception as e:
-                                        # Skip ill-conditioned subsets
-                                        continue
+                                try:
+                                    if is_binary:
+                                        model = LogisticRegression().fit(X_train_sub, y_train)
+                                        y_pred = model.predict(X_test_sub)
+                                        score = accuracy_score(y_test, y_pred)
+                                    else:
+                                        model = LinearRegression().fit(X_train_sub, y_train)
+                                        y_pred = model.predict(X_test_sub)
+                                        score = r2_score(y_test, y_pred)
+                                except Exception as e:
+                                    # Skip ill-conditioned subsets
+                                    continue
 
-                                    if score > best_score:
-                                        best_score = score
-                                        best_subset = dims
-                                        best_coef = model.coef_
-                                        best_model = model
+                                if score > best_score:
+                                    best_score = score
+                                    best_subset = dims
+                                    best_coef = model.coef_
+                                    best_model = model
 
-                            results.append({
-                                'label_dim': i,
-                                'is_binary': is_binary,
-                                'best_subset': best_subset,
-                                'score': best_score,
-                                'coef': best_coef.tolist() if best_coef is not None else None,
-                                'intercept': (best_model.intercept_.tolist() if best_model.intercept_ is not None else None) if best_model else None,
-                                'subset_size': len(best_subset) if best_subset else None,
-                            })
-                            return results
-                    try:
-                        subset_results = analyze_label_encodings(labels_train_np, labels_test_np, encoded_train_np, encoded_test_np)
-                    except Exception as e:
-                        pass
+                        results.append({
+                            'label_dim': i,
+                            'is_binary': is_binary,
+                            'best_subset': best_subset,
+                            'score': best_score,
+                            'coef': best_coef.tolist() if best_coef is not None else None,
+                            'intercept': (best_model.intercept_.tolist() if best_model.intercept_ is not None else None) if best_model else None,
+                            'subset_size': len(best_subset) if best_subset else None,
+                        })
+                        return results
+                try:
+                    subset_results = analyze_label_encodings(labels_train_np, labels_test_np, encoded_train_np, encoded_test_np)
+                except Exception as e:
+                    pass
 
-            source = kwargs['config']['source']
-            target_key = f'{source}_target'
-            targets2indices = defaultdict(list)
-            for i, t in enumerate(eval_sub_data[target_key]):
-                targets2indices[t].append(i)
+
+
 
             encoded_by_target = defaultdict(list)
             for target, indices in targets2indices.items():
@@ -423,7 +430,6 @@ class Setup:
             encoded_by_target = dict(encoded_by_target)
 
             # Group encoded values by class
-            binary_labels = eval_sub_data['binary_labels']
 
             if isinstance(binary_labels[0], list):
                 binary_labels = [tuple(l) for l in binary_labels]
@@ -484,8 +490,8 @@ class Setup:
                 result['sub_results'] = multi_output
 
             for key in ['texts', 'factual_target', 'counterfactual_target']:
-                if key in eval_sub_data:
-                    result[key] = eval_sub_data[key]
+                if key in other_keys:
+                    result[key] = other_keys[key]
 
             total_result[eval_key] = result
 
@@ -526,7 +532,7 @@ class Setup:
         if force or not os.path.isfile(output_result):
             split = 'test'
             file_format = 'csv'
-            enc_output = get_file_name(model, max_size=max_size, file_format=file_format, split=split, setup_id=self.id)
+            enc_output = get_file_name(model, max_size=max_size, file_format=file_format, split=split, v=3)
             if not os.path.isfile(enc_output):
                 py_print(f'Analyze model {model} since file {enc_output} does not exist')
                 analysis = self.analyze_models(model, max_size=max_size, split=split, force=force)
@@ -639,7 +645,6 @@ class Setup:
                 py_print('\tCorrelation:', encoder_metrics['pearson_total'])
                 py_print('\tAccuracy:', encoder_metrics['acc'])
             if 'pearson' in encoder_metrics:
-                print('Deprecated: pearson is no longer used; use pearson instead')
                 py_print('\tCorrelation MF:', encoder_metrics['pearson'])
             elif 'pearson_MF' in encoder_metrics:
                 py_print('\tCorrelation MF:', encoder_metrics['pearson'])
@@ -661,157 +666,6 @@ class Setup:
         base_output = model_with_gradiend.gradiend.kwargs['training']['config']['output']
         return self._post_training(base_output, step=global_step)
 
-
-    def _post_training(self, base_output, step=None):
-        import os
-        import json
-        import numpy as np
-        import matplotlib.pyplot as plt
-        from sklearn.decomposition import PCA
-        from matplotlib.patches import Patch
-
-        # --- Configuration
-        eval_dir = os.path.join(base_output, 'eval_training')
-        reference_file = os.path.join(eval_dir, f'{step}.json')
-
-        # --- Function to load and preprocess data
-        def load_encoded_and_labels(json_path):
-            with open(json_path, 'r') as f:
-                data = json.load(f)
-
-            if 'main' in data:
-                data = data['main']
-
-            encoded = data['encoded']
-            print(encoded)
-            encoded, labels_raw  = zip(*encoded)
-            labels = [x > 0 if isinstance(x, (float, int)) else tuple(b > 0 for b in x) for x in labels_raw]
-            return np.array(encoded), labels
-
-        # --- Step 1: Train PCA on reference file
-        try:
-            X_ref, labels_ref = load_encoded_and_labels(reference_file)
-        except FileNotFoundError:
-            # use the latest json file in eval_training if reference file does not exist
-            print(f"Reference file {reference_file} not found. Using the latest file in {eval_dir}.")
-            json_files = [f for f in os.listdir(eval_dir) if f.endswith('.json')]
-            if not json_files:
-                raise FileNotFoundError(f"No JSON files found in {eval_dir}.")
-            latest_file = max(json_files, key=lambda f: int(f.split('.')[0]))
-            reference_file = os.path.join(eval_dir, latest_file)
-            X_ref, labels_ref = load_encoded_and_labels(reference_file)
-
-        # Create consistent label-to-index mapping across all files
-        unique_labels = sorted(set(labels_ref))
-        label_to_index = {lbl: idx for idx, lbl in enumerate(unique_labels)}
-        label_indices_ref = np.array([label_to_index[lbl] for lbl in labels_ref])
-
-        # Fit PCA
-        pca = PCA()
-        pca.fit(X_ref)
-        import numpy as np
-
-        def num_components_for_variance(pca, threshold=0.95):
-            cumulative = np.cumsum(pca.explained_variance_ratio_)
-            return np.searchsorted(cumulative, threshold) + 1
-
-        n_components = num_components_for_variance(pca, threshold=0.95)
-        print(f"Number of components for 95% variance: {n_components}")
-
-        pca = PCA(n_components=2)
-        pca.fit_transform(X_ref)
-
-        # --- Function to plot and save PCA result
-        def plot_pca(X_2d, label_indices, title, output_path):
-            num_classes = len(label_to_index)
-            cmap = plt.cm.get_cmap('tab10', num_classes)
-
-            plt.figure(figsize=(8, 6))
-            plt.scatter(X_2d[:, 0], X_2d[:, 1], c=label_indices, cmap=cmap, alpha=0.6)
-
-            # Legend
-            legend_handles = [
-                Patch(color=cmap(i), label=str(lbl))
-                for i, lbl in enumerate(label_to_index)
-            ]
-            plt.title(title)
-            plt.xlabel('PCA Component 1')
-            plt.ylabel('PCA Component 2')
-            plt.legend(handles=legend_handles, title='Labels')
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(output_path)
-            plt.show()
-            plt.close()
-
-        # --- Step 2: Apply PCA to all other JSON files in eval_training
-        for filename in os.listdir(eval_dir):
-            if not filename.endswith('.json'):
-                continue
-            filepath = os.path.join(eval_dir, filename)
-
-            try:
-                X, labels = load_encoded_and_labels(filepath)
-                # Ensure labels exist in mapping; skip file if not
-                if not all(lbl in label_to_index for lbl in labels):
-                    print(f"Skipping {filename} due to unknown label(s)")
-                    continue
-                label_indices = np.array([label_to_index[lbl] for lbl in labels])
-                X_2d = pca.transform(X)
-
-                # Save plot
-                step = os.path.splitext(filename)[0]
-                plot_path = os.path.join(eval_dir, f'pca_{step}.pdf')
-                plot_pca(X_2d, label_indices, title=f'PCA of Encoded Features ({step})', output_path=plot_path)
-                print(f"Saved: {plot_path}")
-            except Exception as e:
-                print(f"Error processing {filename}: {e}")
-
-        # --- Step 3: Correlation Analysis and Linear Regression
-        print("\n=== Correlation between Encoded Dimensions and Label Dimensions ===")
-        with open(reference_file, 'r') as f:
-            raw_data = json.load(f)
-        if 'main' in raw_data:
-            raw_data = raw_data['main']
-
-        enc_raw, labels_raw = zip(*raw_data['encoded'])
-        X_ref = np.array(enc_raw)
-        Y_ref = np.array(labels_raw)  # continuous 2D labels
-
-        # Compute Pearson correlation
-        correlation_matrix = np.zeros((X_ref.shape[1], Y_ref.shape[1]))
-        pval_matrix = np.zeros_like(correlation_matrix)
-        correlation_lines = []
-
-        for i in range(X_ref.shape[1]):
-            for j in range(Y_ref.shape[1]):
-                corr, pval = pearsonr(X_ref[:, i], Y_ref[:, j])
-                correlation_matrix[i, j] = corr
-                pval_matrix[i, j] = pval
-                line = f"Encoded dim {i} vs Label dim {j}: Pearson r = {corr:.3f}, p = {pval:.3g}"
-                print(line)
-                correlation_lines.append(line)
-
-        # --- Linear Regression with train/test split
-        print("\n=== Linear Regression: Train/Test Split (80/20) ===")
-        X_train, X_test, y_train, y_test = train_test_split(X_ref, Y_ref, test_size=0.2, random_state=42)
-        #model = LinearRegression()
-        model = Ridge(alpha=1.0)
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        r2 = r2_score(y_test, y_pred)
-        r2_line = f"R² score on test set: {r2:.4f}"
-        print(r2_line)
-
-        # --- Save results to file
-        results_path = os.path.join(eval_dir, 'regression_results.txt')
-        with open(results_path, 'w') as f:
-            f.write("=== Correlation Results ===\n")
-            f.write("\n".join(correlation_lines))
-            f.write("\n\n=== Linear Regression Performance ===\n")
-            f.write(r2_line + "\n")
-
-        print(f"Saved regression and correlation results to {results_path}")
 
 
 import numpy as np
@@ -1017,8 +871,34 @@ class BatchedTrainingDataset(Dataset):
             'labels': labels
         }
 
+plural_keys = {
+    'gradient': 'gradients',
+    'source': 'gradients',
+    'text': 'texts',
+    'label': 'labels',
+    'binary_label': 'binary_labels',
+    'metadata': 'metadata',
+}
 
-def create_eval_dataset(setup, model_with_gradiend, split='val', source='factual', dataset_filter=None, use_caching=False, **kwargs):
+class JITGradientLoader:
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __iter__(self):
+        for i in range(len(self.ds)):
+            d = self.ds[i]
+            del d['target']
+
+
+            # convert in dict of lists
+            results = {}
+            for key in d.keys():
+                key_plural = plural_keys[key] if key in plural_keys else key
+                results[key_plural] = [entry[key] for entry in [d]]
+
+            yield results
+
+def create_eval_dataset(setup, model_with_gradiend, split='val', source='factual', dataset_filter=None, use_caching=False, pre_load_gradients=True, **kwargs):
     if use_caching is None and hasattr(model_with_gradiend, 'feature_creator_id'):
         use_caching = model_with_gradiend.feature_creator_id == 'grad'
 
@@ -1045,9 +925,12 @@ def create_eval_dataset(setup, model_with_gradiend, split='val', source='factual
         target=None,
         cache_dir=cache_dir,
         dtype=torch.bfloat16,
-        device=torch.device('cpu'),
+        device=torch.device('cpu') if pre_load_gradients else model_with_gradiend.gradiend.device_encoder,
         return_metadata=True,
     )
+
+    if not pre_load_gradients:
+        return gradient_dataset
 
 
     result_dicts = []
@@ -1055,15 +938,6 @@ def create_eval_dataset(setup, model_with_gradiend, split='val', source='factual
     for entry in tqdm(gradient_dataset, desc=f'Loading cached evaluation data', leave=False):
         del entry['target']
         result_dicts.append(entry)
-
-    plural_keys = {
-        'gradient': 'gradients',
-        'source': 'gradients',
-        'text': 'texts',
-        'label': 'labels',
-        'binary_label': 'binary_labels',
-        'metadata': 'metadata',
-    }
 
     # convert in dict of lists
     results = {}

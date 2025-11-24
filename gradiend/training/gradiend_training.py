@@ -19,7 +19,8 @@ def train(setup, base_model, model_config=None, n=3, metric='pearson', force=Fal
     else:
         version = f'/{version}'
 
-    base_model_id = base_model.split('/')[-1]
+
+    base_model_id = (base_model if isinstance(base_model, str) else base_model.name_or_path).removesuffix('/best').split('/')[-1]
     main_output = f'results/models/{setup.id}/{base_model_id}{version.replace("/", "-")}'
     if only_return_output:
         return main_output
@@ -27,10 +28,11 @@ def train(setup, base_model, model_config=None, n=3, metric='pearson', force=Fal
     metrics = []
     total_start = time.time()
     times = []
+    init_model_config = model_config.copy()
 
     for i in range(n):
         start = time.time()
-        output = f'results/experiments/gradiend/{setup.id}/{base_model}{version}/{i}'
+        output = f'results/experiments/gradiend/{setup.id}/{base_model_id}{version}/{i}'
         metrics_file = f'{output}/metrics.json'
         if not force and os.path.exists(metrics_file):
             metrics.append(json.load(open(metrics_file)))
@@ -40,7 +42,7 @@ def train(setup, base_model, model_config=None, n=3, metric='pearson', force=Fal
 
         if not os.path.isfile(f'{output}/pytorch_model.bin') or force:
             print('Training', output)
-            model_config['seed'] = i + 1
+            model_config['seed'] = i + init_model_config.get('seed', 4)
             if 'layers' in model_config:
                 train_multiple_layers_gradiend(setup, model=base_model, output=output, **model_config)
             else:
@@ -60,7 +62,7 @@ def train(setup, base_model, model_config=None, n=3, metric='pearson', force=Fal
         times.append(time.time() - start)
 
         if clear_cache:
-            cache_folder = f'results/cache/gradients/{setup.id}/{base_model}'
+            cache_folder = f'results/cache/gradients/{setup.id}/{base_model_id}'
             if os.path.exists(cache_folder):
                 shutil.rmtree(cache_folder)
 
@@ -70,7 +72,7 @@ def train(setup, base_model, model_config=None, n=3, metric='pearson', force=Fal
         print('Best metric at index', best_index, 'with value', metrics[best_index])
 
         # copy the best model to output
-        shutil.copytree(f'results/experiments/gradiend/{setup.id}/{base_model}{version}/{best_index}', main_output, dirs_exist_ok=True)
+        shutil.copytree(f'results/experiments/gradiend/{setup.id}/{base_model_id}{version}/{best_index}', main_output, dirs_exist_ok=True)
         print('Copied best model to', main_output)
 
         total_time = time.time() - total_start
@@ -84,9 +86,9 @@ def train(setup, base_model, model_config=None, n=3, metric='pearson', force=Fal
         # check if copying is necessary
         if not os.path.exists(main_output) or not os.path.isfile(f'{main_output}/pytorch_model.bin'):
             print('Copying trained model to output')
-            shutil.copytree(f'results/experiments/gradiend/{setup.id}/{base_model}{version}/0', main_output, dirs_exist_ok=True)
+            shutil.copytree(f'results/experiments/gradiend/{setup.id}/{base_model_id}{version}/0', main_output, dirs_exist_ok=True)
     else:
-        print(f'No metrics found for model {base_model}, skipping saving output')
+        print(f'No metrics found for model {base_model_id}, skipping saving output')
         main_output = output
 
 
@@ -101,7 +103,7 @@ def train_for_configs(setup, model_configs, n=3, metric='pearson', force=False, 
             try:
                 setup.select(model)
                 pass
-            except Exception as e:
+            except NotImplementedError as e:
                 print(f'Error selecting model: {e}')
 
 

@@ -107,7 +107,7 @@ def train(
     model.to(DEVICE)
 
     # ======= Optimizer =======
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.classifier.parameters(), lr=lr)
 
     # ======= Training Loop =======
     model.train()

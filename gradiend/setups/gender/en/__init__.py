@@ -6,6 +6,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import pearsonr
 from tqdm.auto import tqdm
 from matplotlib import pyplot as plt
 import seaborn as sns
@@ -336,7 +337,7 @@ class GenderEnSetup(Setup):
         }
 
     def get_model_metrics(self, output, split='test'):
-        return get_model_metrics(output, split=split)
+        return get_model_metrics(output, split=split, v=3)
 
     def create_training_data(self, *args, **kwargs):
         return create_training_dataset(*args, **kwargs)
@@ -344,7 +345,17 @@ class GenderEnSetup(Setup):
     def analyze_decoder(self, *args, **kwargs):
         return default_evaluation(*args, **kwargs)
 
-    def analyze_models(self, *models, max_size=None, force=False, split='test', prefix=None, best_score=None):
+    def analyze_models(self,
+                       *models,
+                       max_size=None,
+                       force=False,
+                       split='test',
+                       prefix=None,
+                       best_score=None,
+                       top_k=None,
+                       top_k_part=None,
+                       return_output_path=False,
+                       ):
         if prefix:
             # find all models in the folder with the suffix
             best_score = '_best' if best_score else ''
@@ -362,11 +373,11 @@ class GenderEnSetup(Setup):
         dfs = {}
         for model in models:
 
-            output = get_file_name(model, max_size=max_size, file_format='csv', split=split, v=3)
+            output = get_file_name(model, max_size=max_size, file_format='csv', split=split, v=3, top_k=top_k, top_k_part=top_k_part)
 
             if force or not os.path.isfile(output):
                 model_with_ae = ModelWithGradiend.from_pretrained(model)
-                analyze_df = self.analyze_model(model_with_ae, df, names_df, output=output, df_no_gender=df_no_gender)
+                analyze_df = self.analyze_model(model_with_ae, df, names_df, output=output, df_no_gender=df_no_gender, top_k=top_k, top_k_part=top_k_part)
                 print(f'Done with Model {model}')
 
             else:
@@ -374,12 +385,26 @@ class GenderEnSetup(Setup):
                 analyze_df = pd.read_csv(output)
 
             if len(models) == 1:
+                if return_output_path:
+                    return output
                 return analyze_df
-            dfs[model] = analyze_df
+            if return_output_path:
+                dfs[model] = output
+            else:
+                dfs[model] = analyze_df
         return dfs
 
-    def analyze_model(self, model_with_gradiend, genter_df, names_df, output, df_no_gender=None, include_B=False,
-                                  plot=False):
+    def analyze_model(self, 
+                      model_with_gradiend, 
+                      genter_df, 
+                      names_df, 
+                      output, 
+                      df_no_gender=None, 
+                      include_B=False,
+                      plot=False,
+                      top_k=None,
+                      top_k_part=None,
+                      ):
         if not include_B and 'B' in names_df['gender'].unique():
             if not 'genders' in names_df:
                 raise ValueError('The names_df must contain the key genders if include_B is False')
@@ -457,8 +482,9 @@ class GenderEnSetup(Setup):
                     inputs.append((filled_text, masked_label))
                     if is_llama:
                         masked_label = f' {masked_label}' # todo lammainstr
-                        #filled_text += ' '
-                    encoded = model_with_gradiend.encode(filled_text, label=masked_label)
+                        filled_text = filled_text.strip() # todo lammainstr
+
+                    encoded = model_with_gradiend.encode(filled_text, label=masked_label, top_k=top_k, top_k_part=top_k_part)
 
                 if hasattr(encoded, 'tolist'):
                     encoded = encoded.tolist()
@@ -520,7 +546,7 @@ class GenderEnSetup(Setup):
                 text = row['text']
                 encoded, masked_text, label = model_with_gradiend.mask_and_encode(text, ignore_tokens=gender_tokens,
                                                                                   return_masked_text=True,
-                                                                                  single_mask=True)
+                                                                                  single_mask=True, top_k=top_k, top_k_part=top_k_part)
                 if encoded is None:
                     continue
                 texts.append(masked_text)
@@ -550,7 +576,7 @@ class GenderEnSetup(Setup):
         torch.manual_seed(42)
         for text in tqdm(filled_texts, desc='GENTER data without gender words masked'):
             encoded, masked_text, label = model_with_gradiend.mask_and_encode(text, ignore_tokens=gender_tokens,
-                                                                              return_masked_text=True)
+                                                                              return_masked_text=True, top_k=top_k, top_k_part=top_k_part)
             if encoded is None:
                 continue
 
@@ -609,4 +635,113 @@ class GenderEnSetup(Setup):
             print('Correlation MF', cor)
 
         return total_results
+
+    def analyze_models_with_other_data(
+            self,
+            model_with_gradiend,
+            input_csv="data/other_gender_data_balanced.csv",
+            top_k=None,
+            top_k_part=None,
+            plot=False
+        ):
+        import pandas as pd
+        import torch
+        from tqdm import tqdm
+        tqdm.pandas()
+
+        output = f"{model_with_gradiend.name_or_path}/other_gender_analysis.csv"
+        if False and os.path.isfile(output):
+            return pd.read_csv(output)
+
+
+        df = pd.read_csv(input_csv)
+        tokenizer = model_with_gradiend.tokenizer
+        mask_token = tokenizer.mask_token
+        is_llama = 'llama' in tokenizer.name_or_path.lower()
+
+        def process_row(row):
+            masked_text = row["masked_text"]
+            true_label = row["token"]  # actual token used for mask
+
+            # replace placeholder with model mask token
+            if model_with_gradiend.is_generative:
+                masked_input = masked_text.split('[MASK]')[0]
+            else:
+                masked_input = masked_text.replace("[MASK]", mask_token)
+            if is_llama:
+                masked_input = masked_input.strip()
+
+            try:
+                encoded = model_with_gradiend.encode(
+                    masked_input,
+                    label=true_label,
+                    top_k=top_k,
+                    top_k_part=top_k_part
+                )
+            except Exception:
+                return {
+                    'text': row['text'],
+                    'masked_text': masked_text,
+                "token": row["token"],
+                "group": row["group"],
+                "label": row["label"],  # numeric +1/-1
+                "encoded": None,
+                }
+
+            if hasattr(encoded, "tolist"):
+                encoded = encoded.tolist()
+            if isinstance(encoded, list) and len(encoded) == 1:
+                encoded = encoded[0]
+
+            return {
+                "text": row["text"],
+                "masked_text": masked_text,
+                "token": row["token"],
+                "group": row["group"],
+                "label": row["label"],  # numeric +1/-1
+                "encoded": encoded
+            }
+
+        tqdm.pandas(desc="Analyzing balanced gender data")
+        results = df.progress_apply(process_row, axis=1).tolist()
+        results_df = pd.DataFrame(results)
+        results_df.to_csv(output, index=False)
+
+        if plot:
+            import seaborn as sns
+            import matplotlib.pyplot as plt
+            sns.boxplot(x="group", y="pred", data=results_df)
+            plt.title(model_with_gradiend.name_or_path)
+            plt.show()
+
+        return results_df
+
+    def get_other_model_metrics(self, analysis):
+        if isinstance(analysis, str):
+            analysis = pd.read_csv(analysis)
+
+        def safe_pearson(x, y):
+            if len(x) < 2 or np.std(x) == 0 or np.std(y) == 0:
+                return float("nan")
+            return pearsonr(x, y)[0]
+
+        preds = analysis["encoded"].values
+        labels = analysis["label"].values
+
+        metrics = {"overall_pearson": safe_pearson(preds, labels)}
+
+        # per token
+        token_corrs = {}
+        for token, group in analysis.groupby("token"):
+            token_corrs[token] = safe_pearson(group["encoded"].values, group["label"].values)
+        metrics["per_token"] = token_corrs
+
+        # per group
+        group_corrs = {}
+        for grp, group in analysis.groupby("group"):
+            group_corrs[grp] = safe_pearson(group["encoded"].values, group["label"].values)
+        metrics["per_group"] = group_corrs
+
+        return metrics
+
 

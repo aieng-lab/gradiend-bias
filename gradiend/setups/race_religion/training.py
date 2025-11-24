@@ -65,6 +65,7 @@ def create_training_dataset(tokenizer,
             for k in range(num_pairs):
                 df[f"label_{k}"] = one_hot[k]
 
+
             # Deterministic split
             if split:
                 # todo save the splits persistently
@@ -80,6 +81,14 @@ def create_training_dataset(tokenizer,
                     df = df[n_train + n_val:]
                 else:
                     raise ValueError(f"Unknown split: {split}. Use 'train', 'val', or 'test'.")
+
+
+            if is_generative:
+                # drop entries where [MASK] appears within the first 10 words to ensure enough context
+                first_10_tokens = df['masked'].str.split().str[:10].str.join(' ')
+                mask_in_first_10 = first_10_tokens.str.contains('[MASK]')
+                df = df[~mask_in_first_10].reset_index(drop=True)
+
 
             is_llama = 'llama' in tokenizer.name_or_path.lower()
             if not is_llama:
@@ -112,7 +121,7 @@ def create_training_dataset(tokenizer,
         target_keys = 'label_idx'
     else:
         target_keys = [f'label_{i}' for i in range(num_pairs)]
-
+# todo check that easy way to get calass is available, e.g., source_id -> categorical classes
     if return_training_dataset:
         return TrainingDataset(
             templates,
@@ -198,12 +207,111 @@ class Religion3DCombinedSetup(Bias3DCombinedSetup):
 class Race3DSetup(MultiClassSetup):
     def __init__(self):
         super().__init__('race', 'white', 'black', 'asian')
-        self.n_features = 3
+        self.n_features = 1
 
 
     def create_training_data(self, *args, **kwargs):
         return create_training_dataset(classes=self.classes, *args, **kwargs)
 
+    def evaluate(self, model_with_gradiend, eval_data, eval_batch_size=32, max_subset_size=5, verbose=True, **kwargs):
+        result = super().evaluate(model_with_gradiend, eval_data, eval_batch_size, max_subset_size, verbose, **kwargs)
+#        print(result)
+
+        encoded_by_class = result['encoded_by_class']
+
+        # plot the encoded values by class with different colors
+        import seaborn as sns
+        x = []
+        y = []
+        for class_name, values in encoded_by_class.items():
+            x.extend([class_name] * len(values))
+            y.extend([v[0] for v in values])
+
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(8, 6))
+        sns.violinplot(x=x, y=y)
+        plt.title(f'Encoded Values by Class for {self.pretty_id}')
+        plt.xlabel('Class')
+        plt.ylabel('Encoded Value')
+        plt.grid(True)
+        plt.show()
+
+        return result
+
+
+
+
+class Race2DSetup(MultiClassSetup):
+    def __init__(self):
+        super().__init__('race', 'white', 'black', 'asian')
+        self.n_features = 2
+
+
+    def create_training_data(self, *args, **kwargs):
+        return create_training_dataset(classes=self.classes, bias_type=self.bias_type, *args, **kwargs)
+
+    def evaluate(self, model_with_gradiend, eval_data, eval_batch_size=32, max_subset_size=5, verbose=True, **kwargs):
+        result = super().evaluate(model_with_gradiend, eval_data, eval_batch_size, max_subset_size, verbose, **kwargs)
+#        print(result)
+
+        encoded_by_class = result['encoded_by_class']
+
+        # plot the encoded values by class with different colors
+        import seaborn as sns
+        x = []
+        y = []
+        for class_name, values in encoded_by_class.items():
+            x.extend([class_name] * len(values))
+            y.extend([v[0] for v in values])
+
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(8, 6))
+        sns.violinplot(x=x, y=y)
+        plt.title(f'Encoded Values by Class for {self.pretty_id}')
+        plt.xlabel('Class')
+        plt.ylabel('Encoded Value')
+        plt.grid(True)
+        plt.show()
+
+        return result
+
+
+
+
+class Religion3DSetup(MultiClassSetup):
+    def __init__(self):
+        super().__init__('religion', 'christian', 'jewish', 'muslim')
+        self.n_features = 1
+
+
+    def create_training_data(self, *args, **kwargs):
+        return create_training_dataset(classes=self.classes, bias_type=self.bias_type, *args, **kwargs)
+
+
+    def evaluate(self, model_with_gradiend, eval_data, eval_batch_size=32, max_subset_size=5, verbose=True, **kwargs):
+        result = super().evaluate(model_with_gradiend, eval_data, eval_batch_size, max_subset_size, verbose, **kwargs)
+#        print(result)
+
+        encoded_by_class = result['encoded_by_class']
+
+        # plot the encoded values by class with different colors
+        import seaborn as sns
+        x = []
+        y = []
+        for class_name, values in encoded_by_class.items():
+            x.extend([class_name] * len(values))
+            y.extend([v[0] for v in values])
+
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(8, 6))
+        sns.violinplot(x=x, y=y)
+        plt.title(f'Encoded Values by Class for {self.pretty_id}')
+        plt.xlabel('Class')
+        plt.ylabel('Encoded Value')
+        plt.grid(True)
+        plt.show()
+
+        return result
 
 
 def train_multi_dim_gradiends(configs, version=None, activation='tanh', setups=None):

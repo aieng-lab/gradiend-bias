@@ -88,11 +88,12 @@ def get_file_name(base_file_name, file_format=None, **kwargs):
     first_param = True
     for key, value in sorted(kwargs.items()):
         if value is not None:
-            if first_param:
-                output += '_params'
-                first_param = False
-
-            output += f'_{key[:3]}_{value}'
+            key_output = f'_{key[:3]}_{value}'
+            if key_output not in output:
+                if first_param:
+                    output += '_params'
+                    first_param = False
+                output += f'_{key[:3]}_{value}'
 
     if file_format and not output.endswith(file_format):
         output += '.' + file_format
@@ -115,6 +116,7 @@ def get_model_metrics(*encoded_values, prefix=None, suffix='.csv', **kwargs):
 
     raw_encoded_values = encoded_values[0]
 
+
     encoded_values = get_file_name(raw_encoded_values, file_format='csv', **kwargs)
     json_file = encoded_values.replace('.csv', '.json')
 
@@ -124,117 +126,142 @@ def get_model_metrics(*encoded_values, prefix=None, suffix='.csv', **kwargs):
         print('Computing model metrics for', encoded_values)
 
     df_all = pd.read_csv(encoded_values)
-    try:
-        df = df_all[df_all['type'] == 'gender masked']
-    except KeyError:
-        df = df_all
-
-    df_copy = df
-    df_without_B = df[df['state'] != 'B'].copy()
 
 
-    df_without_B['z_score_MF'] = z_score(df_without_B, key='encoded', groupby='text')
-    df_without_B['global_z_score_MF'] = z_score(df_without_B['encoded'])
+    if not isinstance(df_all['encoded'].dtype, float):
+        # encoded is list of floats as string, parse to list
+        df_all['encoded_list'] = df_all['encoded'].apply(json_loads)
 
-    # state_value in text_df still refers to old labeling with M being 1!
-    acc_M_positive = np.mean([((text_df['encoded'] >= 0) == text_df['state_value'].astype(bool)).sum() / len(text_df) for text, text_df in df_without_B.groupby('text')])
-    acc_M_negative = np.mean([((text_df['encoded'] < 0) == text_df['state_value'].astype(bool)).sum() / len(text_df) for text, text_df in df_without_B.groupby('text')])
-    acc_optimized_border_M_pos = np.mean([max(((text_df['encoded'] < threshold) == text_df['state_value'].astype(bool)).sum() / len(text_df) for threshold in np.arange(-1.0, 1.0, 0.1)) for text, text_df in df_without_B.groupby('text')])
-    acc_optimized_border_M_neg = np.mean([max(((text_df['encoded'] > threshold) == text_df['state_value'].astype(bool)).sum() / len(text_df) for threshold in np.arange(-1.0, 1.0, 0.1)) for text, text_df in df_without_B.groupby('text')])
+    # the json_loads might have returned a float if there is only a single value
+    if df_all['encoded'].dtype in (float, np.float64):
+        df_all['encoded_list'] = df_all['encoded'].apply(lambda x: [x])
 
-    acc_M_positive_global = np.mean([((text_df['global_z_score_MF'] >= 0) == text_df['state_value'].astype(bool)).sum() / len(text_df) for text, text_df in df_without_B.groupby('text')])
-    acc_M_negative_global = np.mean([((text_df['global_z_score_MF'] < 0) == text_df['state_value'].astype(bool)).sum() / len(text_df) for text, text_df in df_without_B.groupby('text')])
+    encoded_list_len = len(df_all['encoded_list'].iloc[0])
+    all_dimension_scores = {}
+    for i in range(encoded_list_len):
+        df_all[f'encoded'] = df_all['encoded_list'].apply(lambda x: x[i])
 
-    def calculate_optimal_proportion(group):
-        # Get the global_z_score_MF and state_value columns
-        z_scores = group['global_z_score_MF'].values
-        state_values = group['state_value'].astype(bool).values
+        try:
+            df = df_all[df_all['type'] == 'gender masked']
+        except KeyError:
+            df = df_all
 
-        # Get all unique thresholds
-        unique_thresholds = np.unique(z_scores)
-
-        # Vectorize the thresholding operation
-        proportions = np.array([(z_scores < threshold) == state_values for threshold in unique_thresholds])
-        proportions = proportions.sum(axis=1) / len(group)
-
-        # Return the maximum proportion
-        return proportions.max()
-
-    acc_optimized_border_M_pos_global = np.mean([max(((text_df['global_z_score_MF'] < threshold) == text_df['state_value'].astype(bool)).sum() / len(text_df) for threshold in np.arange(-1.0, 1.0, 0.1)) for text, text_df in df_without_B.groupby('text')])
-    acc_optimized_border_M_neg_global = np.mean([max(((text_df['global_z_score_MF'] > threshold) == text_df['state_value'].astype(bool)).sum() / len(text_df) for threshold in np.arange(-1.0, 1.0, 0.1)) for text, text_df in df_without_B.groupby('text')])
+        df_without_B = df[df['state'] != 'B'].copy()
 
 
-    # rename the keys such that blanks are replaced by '_'
-    df_all = df_all.rename(columns=lambda x: x.replace(' ', '_'))
-    encoded_abs_means = df_all.groupby('type')['encoded'].apply(lambda group: group.abs().mean()).to_dict()
-    encoded_means = df_all.groupby('type')['encoded'].apply(lambda group: group.mean()).to_dict()
-    print(encoded_means)
+        df_without_B['z_score_MF'] = z_score(df_without_B, key='encoded', groupby='text')
+        df_without_B['global_z_score_MF'] = z_score(df_without_B['encoded'])
 
-    # map encoded values to the predicted class, i.e. >= 0.5 -> female, <= -0.5 -> male, >-0.5 & <0.5 -> neutral
-    df_all['predicted_female_pos'] = df_all['encoded'].apply(lambda x: 1 if x >= 0.5 else (-1 if x <= -0.5 else 0))
-    df_all['predicted_male_pos'] = df_all['encoded'].apply(lambda x: 1 if x <= -0.5 else (-1 if x >= 0.5 else 0))
-    labels = df_all['state'].apply(lambda x: 1 if x == 'F' else (-1 if x == 'M' else 0))
-    df_all['state_value'] = labels
-    balanced_acc_female_pos = balanced_accuracy_score(df_all['predicted_female_pos'], labels)
-    balanced_acc_male_pos = balanced_accuracy_score(df_all['predicted_male_pos'], labels)
-    acc_total = max(balanced_acc_female_pos, balanced_acc_male_pos)
+        # state_value in text_df still refers to old labeling with M being 1!
+        acc_M_positive = np.mean([((text_df['encoded'] >= 0) == text_df['state_value'].astype(bool)).sum() / len(text_df) for text, text_df in df_without_B.groupby('text')])
+        acc_M_negative = np.mean([((text_df['encoded'] < 0) == text_df['state_value'].astype(bool)).sum() / len(text_df) for text, text_df in df_without_B.groupby('text')])
+        acc_optimized_border_M_pos = np.mean([max(((text_df['encoded'] < threshold) == text_df['state_value'].astype(bool)).sum() / len(text_df) for threshold in np.arange(-1.0, 1.0, 0.1)) for text, text_df in df_without_B.groupby('text')])
+        acc_optimized_border_M_neg = np.mean([max(((text_df['encoded'] > threshold) == text_df['state_value'].astype(bool)).sum() / len(text_df) for threshold in np.arange(-1.0, 1.0, 0.1)) for text, text_df in df_without_B.groupby('text')])
 
-    pearson_text_cor = df.groupby('text').apply(get_pearson_correlation, include_groups=False)
-    spearman_text_cor = df.groupby('text').apply(get_spearman_correlation, include_groups=False)
-    pearson_text_MF_cor = df_without_B.groupby('text').apply(get_pearson_correlation, include_groups=False)
-    spearman_text_MF_cor = df_without_B.groupby('text').apply(get_spearman_correlation, include_groups=False)
+        acc_M_positive_global = np.mean([((text_df['global_z_score_MF'] >= 0) == text_df['state_value'].astype(bool)).sum() / len(text_df) for text, text_df in df_without_B.groupby('text')])
+        acc_M_negative_global = np.mean([((text_df['global_z_score_MF'] < 0) == text_df['state_value'].astype(bool)).sum() / len(text_df) for text, text_df in df_without_B.groupby('text')])
 
-    pearson_total = get_pearson_correlation(df_all)
-    spearman_total = get_spearman_correlation(df_all)
+        def calculate_optimal_proportion(group):
+            # Get the global_z_score_MF and state_value columns
+            z_scores = group['global_z_score_MF'].values
+            state_values = group['state_value'].astype(bool).values
 
-    pearson = get_pearson_correlation(df)
-    spearman = get_spearman_correlation(df)
+            # Get all unique thresholds
+            unique_thresholds = np.unique(z_scores)
 
-    pearson = get_pearson_correlation(df_without_B)
-    spearman_MF = get_spearman_correlation(df_without_B)
+            # Vectorize the thresholding operation
+            proportions = np.array([(z_scores < threshold) == state_values for threshold in unique_thresholds])
+            proportions = proportions.sum(axis=1) / len(group)
 
-    scores = {
-        'pearson_total': pearson_total['correlation'],
-        'pearson_total_p_value': pearson_total['p_value'],
-        'spearman_total': spearman_total['correlation'],
-        'spearman_total_p_value': spearman_total['p_value'],
-        'acc_total': acc_total,
+            # Return the maximum proportion
+            return proportions.max()
 
-        'pearson': pearson['correlation'],
-        'pearson_p_value': pearson['p_value'],
-        'spearmann': spearman,
-        'spearman_p_value': spearman['p_value'],
-
-        'pearson': pearson['correlation'],
-        'pearson_p_value': pearson['p_value'],
-        'spearman_MF': spearman_MF['correlation'],
-        'spearman_MF_p_value': spearman_MF['p_value'],
-
-        'pearson_text': np.mean([p['correlation'] for  p in pearson_text_cor]).item(),
-        'spearman_text': np.mean([p['correlation'] for  p in spearman_text_cor]).item(),
-
-        'pearson_text_MF': np.mean([p['correlation'] for  p in pearson_text_MF_cor]).item(),
-        'spearman_text_MF': np.mean([p['correlation'] for  p in spearman_text_MF_cor]).item(),
-
-        'acc': max(acc_M_negative, acc_M_positive),
-        'acc_zscore': max(acc_M_negative_global, acc_M_positive_global),
-        'acc_optimized': max(acc_optimized_border_M_neg, acc_optimized_border_M_pos),
-        'acc_optimized_zscore': max(acc_optimized_border_M_neg_global, acc_optimized_border_M_pos_global),
-
-        'encoded_abs_means': encoded_abs_means,
-        'encoded_means': encoded_means,
-
-        **get_std_stats(df),
-    }
-
-    print(scores)
+        acc_optimized_border_M_pos_global = np.mean([max(((text_df['global_z_score_MF'] < threshold) == text_df['state_value'].astype(bool)).sum() / len(text_df) for threshold in np.arange(-1.0, 1.0, 0.1)) for text, text_df in df_without_B.groupby('text')])
+        acc_optimized_border_M_neg_global = np.mean([max(((text_df['global_z_score_MF'] > threshold) == text_df['state_value'].astype(bool)).sum() / len(text_df) for threshold in np.arange(-1.0, 1.0, 0.1)) for text, text_df in df_without_B.groupby('text')])
 
 
+        # rename the keys such that blanks are replaced by '_'
+        df_all = df_all.rename(columns=lambda x: x.replace(' ', '_'))
+        encoded_abs_means = df_all.groupby('type')['encoded'].apply(lambda group: group.abs().mean()).to_dict()
+        encoded_means = df_all.groupby('type')['encoded'].apply(lambda group: group.mean()).to_dict()
+        print(encoded_means)
+
+        # map encoded values to the predicted class, i.e. >= 0.5 -> female, <= -0.5 -> male, >-0.5 & <0.5 -> neutral
+        df_all['predicted_female_pos'] = df_all['encoded'].apply(lambda x: 1 if x >= 0.5 else (-1 if x <= -0.5 else 0))
+        df_all['predicted_male_pos'] = df_all['encoded'].apply(lambda x: 1 if x <= -0.5 else (-1 if x >= 0.5 else 0))
+        labels = df_all['state'].apply(lambda x: 1 if x == 'F' else (-1 if x == 'M' else 0))
+        df_all['state_value'] = labels
+        balanced_acc_female_pos = balanced_accuracy_score(df_all['predicted_female_pos'], labels)
+        balanced_acc_male_pos = balanced_accuracy_score(df_all['predicted_male_pos'], labels)
+        acc_total = max(balanced_acc_female_pos, balanced_acc_male_pos)
+
+        #pearson_text_cor = df.groupby('text').apply(get_pearson_correlation, include_groups=False)
+        #spearman_text_cor = df.groupby('text').apply(get_spearman_correlation, include_groups=False)
+        #pearson_text_MF_cor = df_without_B.groupby('text').apply(get_pearson_correlation, include_groups=False)
+        #spearman_text_MF_cor = df_without_B.groupby('text').apply(get_spearman_correlation, include_groups=False)
+
+        pearson_total = get_pearson_correlation(df_all)
+        spearman_total = get_spearman_correlation(df_all)
+
+        pearson = get_pearson_correlation(df)
+        spearman = get_spearman_correlation(df)
+
+        pearson = get_pearson_correlation(df_without_B)
+        spearman_MF = get_spearman_correlation(df_without_B)
+
+        mean_M = df_all[df_all['state'] == 'M']['encoded'].mean()
+        mean_F = df_all[df_all['state'] == 'F']['encoded'].mean()
+        mean_non_M_F = df_all[(df_all['state'] != 'M') & (df_all['state'] != 'F')]['encoded'].mean()
+
+        scores = {
+            'pearson_total': pearson_total['correlation'],
+            'pearson_total_p_value': pearson_total['p_value'],
+            'spearman_total': spearman_total['correlation'],
+            'spearman_total_p_value': spearman_total['p_value'],
+            'acc_total': acc_total,
+
+            'pearson': pearson['correlation'],
+            'pearson_p_value': pearson['p_value'],
+            'spearmann': spearman,
+            'spearman_p_value': spearman['p_value'],
+
+            'pearson': pearson['correlation'],
+            'pearson_p_value': pearson['p_value'],
+            'spearman_MF': spearman_MF['correlation'],
+            'spearman_MF_p_value': spearman_MF['p_value'],
+
+            #'pearson_text': np.mean([p['correlation'] for  p in pearson_text_cor]).item(),
+            #'spearman_text': np.mean([p['correlation'] for  p in spearman_text_cor]).item(),
+
+            #'pearson_text_MF': np.mean([p['correlation'] for  p in pearson_text_MF_cor]).item(),
+            #'spearman_text_MF': np.mean([p['correlation'] for  p in spearman_text_MF_cor]).item(),
+
+            'acc': max(acc_M_negative, acc_M_positive),
+            'acc_zscore': max(acc_M_negative_global, acc_M_positive_global),
+            'acc_optimized': max(acc_optimized_border_M_neg, acc_optimized_border_M_pos),
+            'acc_optimized_zscore': max(acc_optimized_border_M_neg_global, acc_optimized_border_M_pos_global),
+
+            'encoded_abs_means': encoded_abs_means,
+            'encoded_means': encoded_means,
+
+            'mean_M': mean_M,
+            'mean_F': mean_F,
+            'mean_N': mean_non_M_F,
+
+            **get_std_stats(df),
+        }
+        print(scores)
+
+        all_dimension_scores[i] = scores
+
+
+    if len(all_dimension_scores) == 1:
+        all_dimension_scores = all_dimension_scores[0]
 
     with open(json_file, 'w') as f:
-        json.dump(scores, f, indent=4)
+        json.dump(all_dimension_scores, f, indent=4)
 
-    return scores
+    return all_dimension_scores
 
 
 def plot_encoded_value_distribution(*models, model_names=None):

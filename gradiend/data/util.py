@@ -17,6 +17,9 @@ def get_file_name(base_file_name, file_format=None, **kwargs):
 
     first_param = True
     for key, value in sorted(kwargs.items()):
+        if key in {'top_k', 'top_k_part'} and value is None:
+            continue
+
         if value is not None:
             if first_param:
                 output += '_params'
