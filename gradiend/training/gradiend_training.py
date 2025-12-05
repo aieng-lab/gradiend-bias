@@ -42,7 +42,7 @@ def train(setup, base_model, model_config=None, n=3, metric='pearson', force=Fal
 
         if not os.path.isfile(f'{output}/pytorch_model.bin') or force:
             print('Training', output)
-            model_config['seed'] = i + init_model_config.get('seed', 4)
+            model_config['seed'] = i + init_model_config.get('seed', 0)
             if 'layers' in model_config:
                 train_multiple_layers_gradiend(setup, model=base_model, output=output, **model_config)
             else:

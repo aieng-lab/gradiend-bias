@@ -311,17 +311,13 @@ def plot_encoded_value_distribution(*models, model_names=None):
 
     combined_df = combined_df[combined_df['state'] != 'B'].reset_index(drop=True)
 
-    #combined_df = combined_df[combined_df['type'] != 'no gender masked'].reset_index(drop=True)
-
     # add some noise to the encoded values to avoid overplotting
     combined_df['encoded'] = combined_df['encoded'] + np.random.normal(0, 0.02, size=len(combined_df))
 
     paired = get_cmap("Paired")
 
-    # extract its colors as a list
     colors = paired.colors  # list of RGBA tuples
 
-    # pick indices you want (0,1,6,7)
     custom_colors = [colors[i] for i in [0, 1, 6, 7]]
 
     # Plot the distribution of the "encoded_value" column

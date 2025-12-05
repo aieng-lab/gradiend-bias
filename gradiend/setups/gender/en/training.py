@@ -124,6 +124,7 @@ class MultiDimGenderEnSetup(Setup):
         mask_token = tokenizer.mask_token
         is_generative = model_with_gradiend.is_generative
         is_llama = 'llama' in tokenizer.name_or_path.lower()
+        is_instruct_model = is_llama and ('instruct' in tokenizer.name_or_path.lower())
 
         modified_cache = []
 
@@ -170,8 +171,8 @@ class MultiDimGenderEnSetup(Setup):
                     else:
                         raise ValueError(f'Unknown source: {source}')
                     inputs.append((filled_text, masked_label))
-                    if is_llama:
-                        masked_label = f' {masked_label}' # todo lammainstr
+                    if is_generative and not is_instruct_model:
+                        masked_label = f' {masked_label}'
                         filled_text = filled_text.strip()
 
                     encoded = model_with_gradiend.encode(filled_text, label=masked_label, top_k=top_k, top_k_part=top_k_part)
