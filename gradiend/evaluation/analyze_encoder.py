@@ -311,9 +311,6 @@ def plot_encoded_value_distribution(*models, model_names=None):
 
     combined_df = combined_df[combined_df['state'] != 'B'].reset_index(drop=True)
 
-    # add some noise to the encoded values to avoid overplotting
-    combined_df['encoded'] = combined_df['encoded'] + np.random.normal(0, 0.02, size=len(combined_df))
-
     paired = get_cmap("Paired")
 
     colors = paired.colors  # list of RGBA tuples

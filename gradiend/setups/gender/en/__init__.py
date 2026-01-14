@@ -65,7 +65,8 @@ class TrainingDataset(Dataset):
         self.neutral_data_prop = neutral_data_prop
         self.is_generative = is_generative
         self.is_instruct_model = 'instruct' in self.tokenizer.name_or_path.lower()
-        if self.is_instruct_model:
+        self.is_llama = 'llama' in self.tokenizer.name_or_path.lower()
+        if self.is_llama and not self.is_instruct_model:
             self.gender_pronoun_tokens = {(gender, upper): self.tokenizer.encode(pronoun[0].upper() + pronoun[1:] if upper else pronoun, add_special_tokens=False)[0] for gender, pronoun in [('M', ' he'), ('F', ' she')] for upper in [True, False]}
         else:
             self.gender_pronoun_tokens = {(gender, upper): self.tokenizer.encode(pronoun[0].upper() + pronoun[1:] if upper else pronoun, add_special_tokens=False)[0] for gender, pronoun in [('M', 'he'), ('F', 'she')] for upper in [True, False]}
@@ -280,9 +281,11 @@ def create_training_dataset(tokenizer,
     names = read_namexact(split=split)
     dataset = read_genter(split=split)
     if max_size:
+        if isinstance(max_size, float) and 0 < max_size < 1:
+            max_size = int(len(dataset) * max_size)
         dataset = dataset.iloc[range(max_size)]
 
-    neutral_data = read_geneutral(max_size=len(dataset), split=split) if neutral_data else None
+    neutral_data = read_geneutral(max_size=len(dataset)) if neutral_data else None
 
     gender_words = get_gender_words()
 
@@ -415,6 +418,7 @@ class GenderEnSetup(Setup):
         mask_token = tokenizer.mask_token
         is_generative = model_with_gradiend.is_generative
         is_llama = 'llama' in tokenizer.name_or_path.lower()
+        is_instruct_model = 'instruct' in tokenizer.name_or_path.lower()
 
         cache_default_predictions_dict = read_default_predictions(model)
 
@@ -480,9 +484,9 @@ class GenderEnSetup(Setup):
                     else:
                         raise ValueError(f'Unknown source: {source}')
                     inputs.append((filled_text, masked_label))
-                    if is_llama:
-                        masked_label = f' {masked_label}' # todo lammainstr
-                        filled_text = filled_text.strip() # todo lammainstr
+                    if is_llama and not is_instruct_model:
+                        masked_label = f' {masked_label}'
+                        filled_text = filled_text.strip()
 
                     encoded = model_with_gradiend.encode(filled_text, label=masked_label, top_k=top_k, top_k_part=top_k_part)
 
@@ -642,19 +646,21 @@ class GenderEnSetup(Setup):
             input_csv="data/other_gender_data_balanced.csv",
             top_k=None,
             top_k_part=None,
-            plot=False
+            plot=False,
+            tokens=None,
         ):
-        import pandas as pd
-        import torch
-        from tqdm import tqdm
         tqdm.pandas()
 
         output = f"{model_with_gradiend.name_or_path}/other_gender_analysis.csv"
-        if False and os.path.isfile(output):
+        if os.path.isfile(output):
             return pd.read_csv(output)
 
 
         df = pd.read_csv(input_csv)
+
+        if tokens:
+            df = df[df['token'].isin(tokens)].reset_index(drop=True)
+
         tokenizer = model_with_gradiend.tokenizer
         mask_token = tokenizer.mask_token
         is_llama = 'llama' in tokenizer.name_or_path.lower()
@@ -678,7 +684,7 @@ class GenderEnSetup(Setup):
                     top_k=top_k,
                     top_k_part=top_k_part
                 )
-            except Exception:
+            except Exception as e:
                 return {
                     'text': row['text'],
                     'masked_text': masked_text,

@@ -1180,10 +1180,13 @@ class ModelWithGradiend(nn.Module):
     def create_inputs(self, masked_text, label):
         item = self.tokenizer(masked_text, return_tensors="pt", max_length=self.tokenizer.model_max_length, truncation=True)
         item = {k: v.to(self.base_model_device) for k, v in item.items()}
-        if hasattr(self.tokenizer, 'tokenizer'):
-            label_token_id = self.tokenizer.tokenizer(f' {label}', add_special_tokens=False)['input_ids']
+        if 'llama' in str(type(self.base_model)).lower() and self.is_instruction_model:
+            # LLaMA Instruct Model
+            label_token_id = self.tokenizer.tokenizer(f'{label}', add_special_tokens=False)['input_ids']
             if self.tokenizer.tokenizer.decode(label_token_id[0]).strip() == '':
                 label_token_id = label_token_id[1:]
+        elif self.is_generative:
+            label_token_id = self.tokenizer(f' {label}', add_special_tokens=False)['input_ids']
         else:
             label_token_id = self.tokenizer(f'{label}', add_special_tokens=False)['input_ids']
         if not len(label_token_id) == 1:

@@ -466,9 +466,11 @@ dependencies:
   - zstandard=0.23.0=py39h08a7858_1
   - zstd=1.5.6=ha6fb4c9_0
   - pip:
-      - en-core-web-sm==3.7.1
       - pyaml==25.7.0
       - pympler==1.1
       - scikit-optimize==0.10.2
       - sentencepiece==0.2.0
       - sns==0.1
+  - post:
+    - python -m spacy download en-core-web-sm==3.7.1
+
