@@ -459,3 +459,189 @@ def convert_string_keys_to_tuples(d):
         return [convert_string_keys_to_tuples(item) for item in d]
     else:
         return d  # Return the item as-is if it's neither dict nor list
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgba
+import os
+import ast  # For parsing string like '(0, 1)' to tuple
+
+def plot_encoded_by_class(
+    result,
+    title="Encoded Points by Class",
+    output=None,
+    #aggregations=('sum', 'mean', 'abs_sum', 'max_abs'),
+    aggregations=('mean_abs'),
+    marker_by_aggregation=None,
+    use_binary_keys_for_styling=True,
+):
+    encoded_by_class = result['encoded_by_class']
+    mean_by_class = result.get('mean_by_class', None)
+
+    if isinstance(aggregations, str):
+        aggregations = [aggregations]
+
+    default_markers = ['o', 's', 'D', '^', 'v', 'P', '*', 'X']
+    if marker_by_aggregation is None:
+        marker_by_aggregation = {
+            agg: default_markers[i % len(default_markers)]
+            for i, agg in enumerate(aggregations)
+        }
+
+    binary_colors = ['blue', 'red']
+    binary_markers = ['o', 's']
+
+    def parse_label(label_str):
+        try:
+            return ast.literal_eval(label_str)
+        except Exception:
+            return None
+
+    def is_binary_key_str(label_str):
+        parsed = parse_label(label_str)
+        return (
+            isinstance(parsed, tuple) and
+            len(parsed) == 2 and
+            all(x in [0, 1] for x in parsed)
+        )
+
+    binary_key_mode = (
+        use_binary_keys_for_styling and
+        all(is_binary_key_str(k) for k in encoded_by_class)
+    )
+
+    def get_color_marker(label_str, idx):
+        if binary_key_mode:
+            parsed = parse_label(label_str)
+            color = binary_colors[parsed[0]]
+            marker = binary_markers[parsed[1]]
+        else:
+            color = plt.cm.tab10(idx % 10)
+            marker = default_markers[idx % len(default_markers)]
+        return color, marker
+
+    def aggregate(arr, exclude_idx, method):
+        other_dims = np.delete(arr, exclude_idx, axis=1)
+        if method == 'sum':
+            return np.sum(other_dims, axis=1)
+        elif method == 'mean':
+            return np.mean(other_dims, axis=1)
+        elif method == 'abs_sum':
+            return np.sum(np.abs(other_dims), axis=1)
+        elif method == 'max_abs':
+            return np.max(np.abs(other_dims), axis=1)
+        elif method == 'mean_abs':
+            return np.mean(np.abs(other_dims), axis=1)
+        else:
+            raise ValueError(f"Unsupported aggregation: {method}")
+
+    # Determine dimensionality
+    first_label = next(iter(encoded_by_class))
+    first_point = np.array(encoded_by_class[first_label])[0]
+    enc_dim = len(first_point)
+    label_dim = len(first_label)
+
+    # Direct 2D plot
+    if enc_dim == 2 and label_dim == 2 and len(aggregations) == 1:
+        plt.figure(figsize=(8, 6))
+        for i, (label, points) in enumerate(encoded_by_class.items()):
+            points = np.array(points)
+            color, marker = get_color_marker(label, i)
+            plt.scatter(points[:, 0], points[:, 1], label=label, color=color, marker=marker, alpha=1)
+
+        plt.title(title)
+        plt.xlabel("Dim 1")
+        plt.ylabel("Dim 2")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+
+        if output:
+            os.makedirs(os.path.dirname(output), exist_ok=True)
+            plt.savefig(output)
+        plt.show()
+
+        data = result['encoded']
+        targets = result['counterfactual_target']
+        # Split labels and encodings
+        labels = [l for _, l in data]
+        encodings = [e for e, _ in data]
+
+        lab1, lab2 = zip(*labels)
+        enc1, enc2 = zip(*encodings)
+
+        # Plotting
+        fig, axs = plt.subplots(1, 2, figsize=(12, 5), sharey=False)
+
+        for i, (label_vals, ax) in enumerate(zip([lab1, lab2], axs)):
+            ax.scatter(enc1, label_vals, label="Encoding Dim 1", alpha=0.7)
+            ax.scatter(enc2, label_vals, label="Encoding Dim 2", alpha=0.7)
+
+            for x1, x2, y, txt in zip(enc1, enc2, label_vals, targets):
+                ax.text(x1, y, txt, fontsize=6)
+                ax.text(x2, y, txt, fontsize=6)
+
+            ax.set_xlabel("Encoding Value")
+            ax.set_ylabel(f"Label Dim {i + 1}")
+            ax.set_title(f"Encodings vs Label Dim {i + 1}")
+            ax.legend()
+
+        plt.tight_layout()
+
+        if output:
+            output2 = output.replace('.pdf', '_2d.pdf')
+            os.makedirs(os.path.dirname(output2), exist_ok=True)
+            plt.savefig(output2)
+
+
+        plt.show()
+
+    else:
+        encoded = np.array(result['encoded'])
+        labels = result['labels']
+        binary_labels = np.array(result['binary_labels'])
+
+        N, D = encoded.shape
+        K = binary_labels.shape[1]
+
+        # Prepare data for seaborn
+        rows = []
+        for d in range(D):  # for each encoded dim
+            for i in range(N):  # for each data point
+                for k in range(K):  # for each binary label dim
+                    rows.append({
+                        'encoded_value': encoded[i, d],
+                        'binary_label_dim': k,
+                        'binary_label_value': binary_labels[i, k].item(),
+                        'encoded_dim': d
+                    })
+
+        df = pd.DataFrame(rows)
+
+        # Plot one subplot per encoded dimension
+        fig, axes = plt.subplots(1, D, figsize=(5 * D, 4), sharey=True)
+
+        if D == 1:
+            axes = [axes]
+
+        for d, ax in enumerate(axes):
+            subset = df[df['encoded_dim'] == d]
+            sns.stripplot(
+                data=subset,
+                x='binary_label_dim',
+                y='encoded_value',
+                hue='binary_label_value',
+                palette={0: 'skyblue', 1: 'salmon'},
+                dodge=True,
+                alpha=0.7,
+                ax=ax
+            )
+            ax.set_title(f'Encoded dim {d}')
+            ax.set_xlabel('Binary label dimension')
+            ax.set_ylabel('Encoded value')
+            ax.legend(title='Label', loc='best')
+
+        plt.tight_layout()
+        plt.show()
