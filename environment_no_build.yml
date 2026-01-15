@@ -472,3 +472,4 @@ dependencies:
       - scikit-optimize==0.10.2
       - sentencepiece==0.2.0
       - sns==0.1
+      - hyperopt
