@@ -8,7 +8,7 @@ from gradiend.setups.gender.en.util import gender_pronouns
 
 
 def load_dataset(name, split=None, trust_remote_code=False):
-    dataset = load_dataset_hf(name, split=sanitize_split(split), )
+    dataset = load_dataset_hf(name, split=sanitize_split(split), trust_remote_code=trust_remote_code)
 
     if split is None:
         return pd.concat([ds.to_pandas() for ds in dataset.values()])
