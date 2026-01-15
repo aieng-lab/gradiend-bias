@@ -472,6 +472,7 @@ dependencies:
       - sentencepiece==0.2.0
       - sns==0.1
       - hyperopt
+      - scikit-optimize
   - post:
     - python -m spacy download en-core-web-sm==3.7.1
 
