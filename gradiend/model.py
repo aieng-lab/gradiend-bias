@@ -1345,50 +1345,6 @@ class ModelWithGradiend(nn.Module):
             loss_bert.backward()
             return self.gradiend.extract_gradients(self.base_model, return_dict=return_dict)
 
-    def forward_pass_create_gradients_(self, inputs, return_dict=False, lr=1e-4, verbose=False):
-        # ensure inputs on same device as base model (or move to cpu — see variant B)
-        inputs = {k: v.to(self.base_model_device) for k, v in inputs.items()}
-        inputs = {k: v.unsqueeze(0) if v.ndim == 1 else (v.squeeze(dim=1) if v.ndim == 3 and v.shape[1] == 1 else v)
-                  for k, v in inputs.items()}
-
-        # run forward
-        outputs = self.base_model(**inputs)
-        loss_bert = outputs.loss
-
-        # collect parameters we care about (only those that require grad)
-        params = [p for p in self.base_model.parameters() if p.requires_grad]
-
-        # compute grads via autograd.grad (does NOT create higher-order graph by default)
-        grads = torch.autograd.grad(loss_bert, params, create_graph=False, retain_graph=False)
-
-        # detach, clone and optionally move to CPU immediately to free GPU memory
-        grads_detached = [g.detach().clone().to('cpu') if g is not None else torch.zeros_like(p, device='cpu')
-                          for g, p in zip(grads, params)]
-
-        # optionally zero out base model grads and delete outputs to free memory
-        self.base_model.zero_grad(set_to_none=True)
-        del outputs
-        for t in inputs.values():
-            try:
-                del t
-            except Exception:
-                pass
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        # convert to dict if needed (keyed by parameter name)
-        if return_dict:
-            named = dict(self.base_model.named_parameters())
-            out = {}
-            idx = 0
-            for name, p in named.items():
-                if p.requires_grad:
-                    out[name] = grads_detached[idx]
-                    idx += 1
-            return out
-        else:
-            # flatten into a single tensor (on CPU)
-            return torch.cat([g.flatten() for g in grads_detached])
 
     @property
     def layers_hash(self):

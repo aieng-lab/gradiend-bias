@@ -2,7 +2,8 @@ import itertools
 
 import numpy as np
 import pandas as pd
-from datasets import Dataset
+import torch
+from datasets import Dataset, load_dataset
 
 from gradiend.setups.util.multiclass import MultiClassSetup, Bias3DCombinedSetup, \
     TrainingDataset
@@ -22,6 +23,8 @@ def create_training_dataset(tokenizer,
                             single_word_texts=False,
                             is_generative=None,
                             return_training_dataset=True,
+                            load_remote_data=True,
+                            balance=True,
                             ):
     if classes is None or len(classes) < 2:
         raise ValueError("Please provide at least two classes in the 'classes' list.")
@@ -44,69 +47,129 @@ def create_training_dataset(tokenizer,
         for j, class_to in enumerate(classes):
             if i == j:
                 continue  # skip same-class
-            ds_path = f"data/{bias_type}/{class_from}_to_{class_to}"
-            try:
-                df = Dataset.load_from_disk(ds_path).to_pandas()
-            except FileNotFoundError:
-                continue  # skip if dataset doesn't exist
 
-            pair_idx = pair_to_index[frozenset((i, j))]
+            if load_remote_data:
 
-            # add index label
-            if num_pairs == 1:
-                df["label_idx"] = label_counter
-                label_counter += 1
-            else:
-                df["label_idx"] = pair_idx
+                ds_name = f'aieng-lab/gradiend_{bias_type}_data'
+                subset = f'{class_from}_to_{class_to}'
+                if False:
+                    df = load_dataset(ds_name, subset=subset, split=split).to_pandas()
 
-            # add one-hot columns
-            one_hot = np.zeros(num_pairs, dtype=int)
-            one_hot[pair_idx] = 1 if i > j else -1
-            for k in range(num_pairs):
-                df[f"label_{k}"] = one_hot[k]
-
-
-            # Deterministic split
-            if split:
-                # todo save the splits persistently
-                train, val, test = 0.7, 0.2, 0.1
-                df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
-                n_train = int(len(df) * train)
-                n_val = int(len(df) * val)
-                if split == "train":
-                    df = df[:n_train]
-                elif split == "val":
-                    df = df[n_train:n_train + n_val]
-                elif split == "test":
-                    df = df[n_train + n_val:]
+                    pair_idx = pair_to_index[frozenset((i, j))]
+                    # add index label
+                    if num_pairs == 1:
+                        df["label_idx"] = label_counter
+                        label_counter += 1
+                    else:
+                        df["label_idx"] = pair_idx
                 else:
-                    raise ValueError(f"Unknown split: {split}. Use 'train', 'val', or 'test'.")
+                    from_from, _, from_to = subset.partition("_to_")
+                    if not from_to:
+                        raise ValueError("subset must be like 'white_to_black'")
+                    classes = [from_from, from_to]
+
+                    def _norm(s):
+                        return "validation" if s in ("val", "validation") else s
+
+                    def load_gradiend_bias_per_class(ds_name, classes, split, masked_col="masked", split_col="split"):
+                        """Load aieng-lab/gradiend_{bias_type}_data in per-class format. Returns Dict[class_name, DataFrame]."""
+                        normalized = _norm(split)  # e.g. "val" -> "validation"
+                        out = {}
+                        for c in classes:
+                            ds = load_dataset(ds_name, c, trust_remote_code=True, split=normalized)
+                            df = ds.to_pandas()
+                            if split_col not in df.columns:
+                                df[split_col] = normalized
+                            out[c] = df
+                        return out
+
+                    per_class = load_gradiend_bias_per_class(ds_name, classes, split)
+                    # Build long-format rows for this pair only
+                    rows = []
+                    for src in [from_from, from_to]:
+                        df = per_class[src]
+                        for _, r in df.iterrows():
+                            tgt = from_to if src == from_from else from_from
+                            rows.append({
+                                "masked": r["masked"], "split": r["split"],
+                                "source": r[src], "target": r[tgt],
+                                "source_id": src, "target_id": tgt,
+                            })
+
+                        if num_pairs == 1:
+                            for row in rows:
+                                row["label_idx"] = label_counter
+                            label_counter += 1
+                        else:
+                            for row in rows:
+                                row["label_idx"] = pair_idx
+                    df = Dataset.from_list(rows)
+                    df = df.to_pandas()
+            else:
+                ds_path = f"data/{bias_type}/{class_from}_to_{class_to}"
+                try:
+                    df = Dataset.load_from_disk(ds_path).to_pandas()
+                except FileNotFoundError:
+                    continue  # skip if dataset doesn't exist
+
+                pair_idx = pair_to_index[frozenset((i, j))]
+
+                # add index label
+                if num_pairs == 1:
+                    df["label_idx"] = label_counter
+                    label_counter += 1
+                else:
+                    df["label_idx"] = pair_idx
+
+                # add one-hot columns
+                one_hot = np.zeros(num_pairs, dtype=int)
+                one_hot[pair_idx] = 1 if i > j else -1
+                for k in range(num_pairs):
+                    df[f"label_{k}"] = one_hot[k]
 
 
-            if is_generative:
-                # drop entries where [MASK] appears within the first 10 words to ensure enough context
-                first_10_tokens = df['masked'].str.split().str[:10].str.join(' ')
-                mask_in_first_10 = first_10_tokens.str.contains('[MASK]')
-                df = df[~mask_in_first_10].reset_index(drop=True)
+                # Deterministic split
+                if split:
+                    # todo save the splits persistently
+                    train, val, test = 0.7, 0.2, 0.1
+                    df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+                    n_train = int(len(df) * train)
+                    n_val = int(len(df) * val)
+                    if split == "train":
+                        df = df[:n_train]
+                    elif split == "val":
+                        df = df[n_train:n_train + n_val]
+                    elif split == "test":
+                        df = df[n_train + n_val:]
+                    else:
+                        raise ValueError(f"Unknown split: {split}. Use 'train', 'val', or 'test'.")
+
+                if is_generative:
+                    # drop entries where [MASK] appears within the first 10 words to ensure enough context
+                    first_10_tokens = df['masked'].str.split().str[:10].str.join(' ')
+                    mask_in_first_10 = first_10_tokens.str.contains('[MASK]')
+                    df = df[~mask_in_first_10].reset_index(drop=True)
 
 
-            is_llama = 'llama' in tokenizer.name_or_path.lower()
-            if not is_llama:
-                df = df[df["source"].isin(vocab) & df["target"].isin(vocab)]
+                is_llama = 'llama' in tokenizer.name_or_path.lower()
+                if not is_llama:
+                    df = df[df["source"].isin(vocab) & df["target"].isin(vocab)]
 
-            if df.empty:
-                raise ValueError('No source and target words in vocab!')
+                if df.empty:
+                    raise ValueError('No source and target words in vocab!')
 
             df['df_ctr'] = df_ctr
             df_ctr += 1
             all_dfs.append(df)
 
-    if not all_dfs:
-        raise ValueError("No datasets found for the given classes.")
+
+        if not all_dfs:
+            raise ValueError("No datasets found for the given classes.")
 
     # ensure all datasets have the same number of examples
-    min_size = min(len(df) for df in all_dfs)
-    all_dfs = [df.sample(min_size, random_state=42).reset_index(drop=True) for df in all_dfs]
+    if balance:
+        min_size = min(len(df) for df in all_dfs)
+        all_dfs = [df.sample(min_size, random_state=42).reset_index(drop=True) for df in all_dfs]
 
     # Merge datasets
     templates = pd.concat(all_dfs, ignore_index=True).sample(frac=1.0).reset_index(drop=True)
@@ -121,7 +184,7 @@ def create_training_dataset(tokenizer,
         target_keys = 'label_idx'
     else:
         target_keys = [f'label_{i}' for i in range(num_pairs)]
-# todo check that easy way to get calass is available, e.g., source_id -> categorical classes
+# todo check that easy way to get class is available, e.g., source_id -> categorical classes
     if return_training_dataset:
         return TrainingDataset(
             templates,
