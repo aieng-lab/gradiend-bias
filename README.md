@@ -26,7 +26,7 @@ Further evaluations of this study can be reproduced using our [expanded version 
   - [`aieng-lab/Llama-3.2-3B-Instruct-gradiend-gender-debiased`](https://huggingface.co/aieng-lab/Llama-3.2-3B-Instruct-gradiend-gender-debiased)
 - Relevant Repositories:
   - [`aieng-lab/bias-bench`](https://github.com/aieng-lab/bias-bench) for evaluation
-  - [`aieng-lab/lm-eval-harness`](https://github.com/aieng-lab/lm-eval-harness) for GLUE zero-shot evaluation
+  - [`aieng-lab/lm-evaluation-harness`](https://github.com/aieng-lab/lm-evaluation-harness) for GLUE zero-shot evaluation
 
 
 ## Install
