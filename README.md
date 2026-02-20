@@ -157,13 +157,11 @@ Religion Data | `gradiend.setups.race_religion.data.generate_race_data()`
 
 ## Citation
 ```
-@misc{drechsel2025gradiendfeaturelearning,
-      title={{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases}, 
-      author={Jonathan Drechsel and Steffen Herbold},
-      year={2025},
-      eprint={2502.01406},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2502.01406}, 
+@inproceedings{drechsel2026gradiend,
+  title     = {{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases},
+  author    = {Drechsel, Jonathan and Herbold, Steffen},
+  booktitle = {Proceedings of the International Conference on Learning Representations},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2502.01406}
 }
 ```
