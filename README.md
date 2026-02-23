@@ -2,7 +2,7 @@
 > Jonathan Drechsel, Steffen Herbold
 [![arXiv](https://img.shields.io/badge/arXiv-2502.01406-blue.svg)](https://arxiv.org/abs/2502.01406)
 
-This repository contains the official source code for the training and evaluation of [GRADIEND: Monosemantic Feature Learning within Neural Networks Applied to Gender Debiasing of Transformer Models](https://arxiv.org/abs/2502.01406).
+This repository contains the official source code for the training and evaluation of [GRADIEND: Feature Learning within neural networks exemplified through biases](https://arxiv.org/abs/2502.01406).
 Further evaluations of this study can be reproduced using our [expanded version of bias-bench](https://github.com/aieng-lab/bias-bench).
 
 ## Quick Links
