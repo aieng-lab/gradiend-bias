@@ -1,5 +1,6 @@
 # GRADIEND: Feature Learning within neural networks exemplified through biases
 > Jonathan Drechsel, Steffen Herbold
+[![OpenReview](https://img.shields.io/badge/OpenReview-ICLR_2026-blue)](https://openreview.net/forum?id=1vBNAnAgCD)
 [![arXiv](https://img.shields.io/badge/arXiv-2502.01406-blue.svg)](https://arxiv.org/abs/2502.01406)
 
 This repository contains the official source code for the training and evaluation of [GRADIEND: Feature Learning within neural networks exemplified through biases](https://arxiv.org/abs/2502.01406).
