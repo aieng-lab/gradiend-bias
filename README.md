@@ -7,6 +7,7 @@ Further evaluations of this study can be reproduced using our [expanded version 
 
 ## Quick Links
 - [GRADIEND Paper](https://arxiv.org/abs/2502.01406)
+- [GRADIEND Python Package](https://github.com/aieng-lab/gradiend)
 - GRADIEND Training and Evaluation Datasets (Hugging Face):
   - [GENTER](https://huggingface.co/datasets/aieng-lab/genter) (Gender Data)
   - [Deprecated: GENEUTRAL](https://huggingface.co/datasets/aieng-lab/geneutral)
